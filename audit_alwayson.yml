@@ -4,7 +4,8 @@
   connection: local
   gather_facts: false
   environment:
-    VCENTER_HOSTS: "{{ lookup('ansible.builtin.env', 'VCENTER_HOSTS') }}"
+    VCENTER_BTA_HOST: "{{ lookup('ansible.builtin.env', 'VCENTER_BTA_HOST') }}"
+    VCENTER_MDE_HOST: "{{ lookup('ansible.builtin.env', 'VCENTER_MDE_HOST') }}"
     VCENTER_USER: "{{ lookup('ansible.builtin.env', 'VCENTER_USER') }}"
     VCENTER_PASS: "{{ lookup('ansible.builtin.env', 'VCENTER_PASS') }}"
     VCENTER_VALIDATE_CERTS: "{{ lookup('ansible.builtin.env', 'VCENTER_VALIDATE_CERTS') | default('false') }}"

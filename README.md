@@ -74,7 +74,7 @@ Por compatibilidad con el repositorio de aprovisionamiento, el pipeline deja `VA
 
 ## Ejecucion
 
-El job requiere el plugin Pipeline Utility Steps (`readYaml`) y HTML Publisher (`publishHTML`). Para ejecución local se deben instalar las dependencias de `requirements.txt` y configurar `VCENTER_HOSTS`, `VCENTER_USER` y `VCENTER_PASS`.
+El job requiere el plugin Pipeline Utility Steps (`readYaml`) y HTML Publisher (`publishHTML`). Para ejecución local se deben instalar las dependencias de `requirements.txt` y configurar `VCENTER_BTA_HOST`, `VCENTER_MDE_HOST`, `VCENTER_USER` y `VCENTER_PASS`.
 
 ## Subir el proyecto a Git
 

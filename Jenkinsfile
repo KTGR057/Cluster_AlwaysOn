@@ -69,7 +69,8 @@ pipeline {
                         container('ansible') {
                             sh '''
                                 export VCENTER_VALIDATE_CERTS="false"
-                                export VCENTER_HOSTS='{"vCenter_BTA":"10.10.170.159","vCenter_MDE":"10.10.144.159"}'
+                                export VCENTER_BTA_HOST="10.10.170.159"
+                                export VCENTER_MDE_HOST="10.10.144.159"
                                 ansible-playbook -i localhost, -c local audit_alwayson.yml
                             '''
                         }

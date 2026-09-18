@@ -310,7 +310,10 @@ def main():
     password = os.environ.get("VCENTER_PASS")
     if not all((user, password)):
         raise RuntimeError("VCENTER_USER y VCENTER_PASS son obligatorios")
-    configured_hosts = json.loads(os.environ.get("VCENTER_HOSTS", "{}"))
+    configured_hosts = {
+        "vCenter_BTA": os.environ.get("VCENTER_BTA_HOST"),
+        "vCenter_MDE": os.environ.get("VCENTER_MDE_HOST"),
+    }
     required_vcenters = sorted({node["vcenter"] for cluster in config["clusters"] for node in cluster["nodes"]})
     hosts = {name: configured_hosts.get(name) or VCENTERS.get(name, (None, None))[0] for name in required_vcenters}
     if any(not value for value in hosts.values()):
