@@ -136,6 +136,15 @@ def vm_snapshot(vm):
     }
 
 
+def infer_vcenter(name):
+    upper_name = name.upper()
+    if upper_name.startswith("BOP") or upper_name.startswith("SERV-BTA"):
+        return "vCenter_BTA"
+    if upper_name.startswith("MEP") or upper_name.startswith("SERV-MDE"):
+        return "vCenter_MDE"
+    raise RuntimeError("No se pudo inferir el vCenter para la VM %s; agregue vcenter al nodo" % name)
+
+
 def all_objects(content, vim_type):
     view = content.viewManager.CreateContainerView(content.rootFolder, [vim_type], True)
     try:
@@ -210,9 +219,10 @@ def compare_cluster(cluster, vms, drs):
         for network in vm["networks"]:
             if network["adapter"] != "Vmxnet3":
                 add_finding(findings, "MEDIUM", "Adaptador de red distinto de VMXNET3", vm["name"] + ".network.adapter", network["adapter"], "Vmxnet3")
-    hosts = {vm["host"] for vm in vms}
+    host_identities = {(vm.get("vcenter", "unknown"), vm["host"]) for vm in vms}
+    hosts = {"%s/%s" % identity for identity in host_identities}
     if len(hosts) < len(vms):
-        add_finding(findings, "HIGH", "Dos o mas nodos comparten host fisico", "runtime.host", dict(zip(names, [vm["host"] for vm in vms])), "hosts distintos")
+        add_finding(findings, "HIGH", "Dos o mas nodos comparten host fisico", "runtime.host", dict(zip(names, ["%s/%s" % (vm.get("vcenter", "unknown"), vm["host"]) for vm in vms])), "hosts distintos")
     return {"name": cluster["name"], "nodes": vms, "findings": findings, "performance": {"physical_hosts": sorted(hosts), "node_count": len(vms)}}
 
 
@@ -238,9 +248,20 @@ def normalize_config(config):
         nodes = item.get("nodes") or item.get("nodos")
         if not name or not isinstance(nodes, list) or len(nodes) < 2:
             raise RuntimeError("Cada cluster requiere nombre y al menos dos nodos")
+        normalized_nodes = []
+        for node in nodes:
+            if isinstance(node, dict):
+                node_name = node.get("name") or node.get("nombre")
+                node_vcenter = node.get("vcenter") or node.get("vCenter")
+            else:
+                node_name = str(node).strip()
+                node_vcenter = None
+            if not node_name:
+                raise RuntimeError("El cluster %s contiene un nodo sin nombre" % name)
+            normalized_nodes.append({"name": node_name.strip(), "vcenter": node_vcenter or infer_vcenter(node_name.strip())})
         clusters.append({
             "name": str(name).strip(),
-            "nodes": [str(node).strip() for node in nodes],
+            "nodes": normalized_nodes,
             "label": item.get("label") or item.get("etiqueta") or str(name).strip(),
             "vcenter_cluster": item.get("vcenter_cluster") or item.get("cluster_vcenter"),
         })
@@ -252,8 +273,8 @@ def normalize_config(config):
 def offline_report(config):
     results = []
     for cluster in config["clusters"]:
-        vms = [mock_vm(name, index) for index, name in enumerate(cluster["nodes"], 1)]
-        drs = [{"severity": "HIGH", "message": "Modo offline: no se valido la regla DRS contra vCenter", "nodes": cluster["nodes"]}]
+        vms = [mock_vm(node["name"], index) for index, node in enumerate(cluster["nodes"], 1)]
+        drs = [{"severity": "HIGH", "message": "Modo offline: no se valido la regla DRS contra vCenter", "nodes": [node["name"] for node in cluster["nodes"]]}]
         results.append(compare_cluster(cluster, vms, drs))
     return {"generated_at": dt.datetime.now(dt.timezone.utc).isoformat(), "vcenter": None, "mode": "offline", "clusters": results}
 
@@ -261,11 +282,11 @@ def offline_report(config):
 def html_report(report):
     rows = []
     for cluster in report["clusters"]:
-        rows.append("<h2>%s</h2><table><tr><th>Nodo</th><th>Host</th><th>vCPU</th><th>Memoria</th><th>Reserva</th><th>Discos</th><th>Red</th></tr>" % html.escape(cluster["name"]))
+        rows.append("<h2>%s</h2><table><tr><th>Nodo</th><th>vCenter</th><th>Host</th><th>vCPU</th><th>Memoria</th><th>Reserva</th><th>Discos</th><th>Red</th></tr>" % html.escape(cluster["name"]))
         for vm in cluster["nodes"]:
             disks = ", ".join(d["provisioning"] for d in vm["disks"])
             networks = ", ".join(n["adapter"] + " / " + str(n["network"]) for n in vm["networks"])
-            rows.append("<tr><td>%s</td><td>%s</td><td>%s</td><td>%s MB</td><td>%s%%</td><td>%s</td><td>%s</td></tr>" % tuple(html.escape(str(x)) for x in [vm["name"], vm["host"], vm["cpu"]["vcpus"], vm["memory"]["assigned_mb"], vm["memory"]["reservation_percent"], disks, networks]))
+            rows.append("<tr><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s MB</td><td>%s%%</td><td>%s</td><td>%s</td></tr>" % tuple(html.escape(str(x)) for x in [vm["name"], vm.get("vcenter", "offline"), vm["host"], vm["cpu"]["vcpus"], vm["memory"]["assigned_mb"], vm["memory"]["reservation_percent"], disks, networks]))
         rows.append("</table><h3>Hallazgos y recomendaciones</h3><ul>")
         for finding in cluster["findings"]:
             rows.append("<li class='%s'><b>%s</b>: %s</li>" % (finding["severity"].lower(), html.escape(finding["severity"]), html.escape(finding["message"])))
@@ -285,24 +306,38 @@ def main():
         report = offline_report(config)
         write_report(report, args.output_dir)
         return
-    host = os.environ.get("VCENTER_HOST")
     user = os.environ.get("VCENTER_USER")
     password = os.environ.get("VCENTER_PASS")
-    if not all((host, user, password)):
-        raise RuntimeError("VCENTER_HOST, VCENTER_USER y VCENTER_PASS son obligatorios")
+    if not all((user, password)):
+        raise RuntimeError("VCENTER_USER y VCENTER_PASS son obligatorios")
+    configured_hosts = json.loads(os.environ.get("VCENTER_HOSTS", "{}"))
+    required_vcenters = sorted({node["vcenter"] for cluster in config["clusters"] for node in cluster["nodes"]})
+    hosts = {name: configured_hosts.get(name) or VCENTERS.get(name, (None, None))[0] for name in required_vcenters}
+    if any(not value for value in hosts.values()):
+        raise RuntimeError("Falta la direccion de uno de los vCenter requeridos: %s" % hosts)
     context = ssl.create_default_context() if os.environ.get("VCENTER_VALIDATE_CERTS", "false").lower() == "true" else ssl._create_unverified_context()
     if connect is None:
         raise RuntimeError("pyVmomi es obligatorio en modo VCENTER")
-    service = connect.SmartConnect(host=host, user=user, pwd=password, sslContext=context)
+    services = {name: connect.SmartConnect(host=host, user=user, pwd=password, sslContext=context) for name, host in hosts.items()}
     try:
-        content = service.RetrieveContent()
+        contents = {name: service.RetrieveContent() for name, service in services.items()}
         results = []
         for cluster in config["clusters"]:
-            vms = [vm_snapshot(find_vm(content, name)) for name in cluster["nodes"]]
-            results.append(compare_cluster(cluster, vms, drs_findings(content, cluster["nodes"])))
-        report = {"generated_at": dt.datetime.now(dt.timezone.utc).isoformat(), "vcenter": host, "clusters": results}
+            vms = []
+            findings = []
+            for node in cluster["nodes"]:
+                snapshot = vm_snapshot(find_vm(contents[node["vcenter"]], node["name"]))
+                snapshot["vcenter"] = node["vcenter"]
+                vms.append(snapshot)
+            for vcenter, content in contents.items():
+                vcenter_nodes = [node["name"] for node in cluster["nodes"] if node["vcenter"] == vcenter]
+                if vcenter_nodes:
+                    findings.extend(drs_findings(content, vcenter_nodes))
+            results.append(compare_cluster(cluster, vms, findings))
+        report = {"generated_at": dt.datetime.now(dt.timezone.utc).isoformat(), "vcenters": hosts, "mode": "vcenter", "clusters": results}
     finally:
-        connect.Disconnect(service)
+        for service in services.values():
+            connect.Disconnect(service)
     write_report(report, args.output_dir)
 
 

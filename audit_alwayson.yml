@@ -4,26 +4,12 @@
   connection: local
   gather_facts: false
   environment:
-    VCENTER_HOST: "{{ lookup('ansible.builtin.env', 'VCENTER_HOST') }}"
+    VCENTER_HOSTS: "{{ lookup('ansible.builtin.env', 'VCENTER_HOSTS') }}"
     VCENTER_USER: "{{ lookup('ansible.builtin.env', 'VCENTER_USER') }}"
     VCENTER_PASS: "{{ lookup('ansible.builtin.env', 'VCENTER_PASS') }}"
     VCENTER_VALIDATE_CERTS: "{{ lookup('ansible.builtin.env', 'VCENTER_VALIDATE_CERTS') | default('false') }}"
   tasks:
-    - name: Ejecutar auditor de solo lectura y generar reportes
-      ansible.builtin.command:
-        argv:
-          - python
-          - scripts/alwayson_audit.py
-          - --input
-          - clusters.yml
-          - --output-dir
-          - artifacts
-          - "{{ '--offline' if (lookup('ansible.builtin.env', 'AUDIT_MODE') | lower) == 'offline' else '' }}"
-      when: lookup('ansible.builtin.env', 'AUDIT_MODE') | lower == 'offline'
-      register: audit_result
-      changed_when: false
-
-    - name: Ejecutar auditor conectado a vCenter
+    - name: Ejecutar auditor de solo lectura en ambos vCenter
       ansible.builtin.command:
         argv:
           - python

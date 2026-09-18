@@ -2,16 +2,13 @@ pipeline {
     agent { label 'k8s-ansible-arus' }
 
     parameters {
-        choice(name: 'MODO_AUDITORIA', choices: ['OFFLINE', 'VCENTER'], description: 'OFFLINE no contacta vCenter y usa datos sinteticos; VCENTER ejecuta la auditoria real')
-        choice(name: 'VCENTER_SELECCIONADO', choices: ['vCenter_BTA', 'vCenter_MDE'], description: 'vCenter donde estan los clusters Always On')
-        choice(name: 'INVENTARIO_SELECCIONADO', choices: ['Prueba_2_nodos', 'Completo', 'Manual'], description: 'Inventario a auditar')
-        text(name: 'CLUSTERS_YAML', defaultValue: '''clusters:
-  - name: AG01
-    nodes:
-      - SQLNODE01
-      - SQLNODE02
-''', description: 'YAML con clusters y nodos. Cada cluster requiere name y nodes.')
-        booleanParam(name: 'VALIDATE_CERTS', defaultValue: false, description: 'Validar el certificado TLS de vCenter')
+                choice(name: 'INVENTARIO_SELECCIONADO', choices: ['Prueba_2_nodos', 'Completo', 'Manual'], description: 'Inventario que se desea auditar')
+                text(name: 'CLUSTERS_YAML', defaultValue: '''clusters:
+    - nombre: AG01
+        nodos:
+            - SQLNODE01
+            - SQLNODE02
+''', description: 'Se utiliza únicamente cuando INVENTARIO_SELECCIONADO es Manual')
     }
 
     environment {
@@ -71,24 +68,13 @@ pipeline {
                     def runAudit = {
                         container('ansible') {
                             sh '''
-                                export AUDIT_MODE="${MODO_AUDITORIA}"
-                                export VCENTER_VALIDATE_CERTS="${VALIDATE_CERTS}"
-                                if [ "${MODO_AUDITORIA}" = "VCENTER" ]; then
-                                  case "${VCENTER_SELECCIONADO}" in
-                                    vCenter_BTA) export VCENTER_HOST=10.10.170.159 ;;
-                                    vCenter_MDE) export VCENTER_HOST=10.10.144.159 ;;
-                                    *) echo "vCenter no permitido" >&2; exit 2 ;;
-                                  esac
-                                fi
+                                export VCENTER_VALIDATE_CERTS="false"
+                                export VCENTER_HOSTS='{"vCenter_BTA":"10.10.170.159","vCenter_MDE":"10.10.144.159"}'
                                 ansible-playbook -i localhost, -c local audit_alwayson.yml
                             '''
                         }
                     }
-                    if (params.MODO_AUDITORIA == 'VCENTER') {
-                        withCredentials([usernamePassword(credentialsId: 'user_vCenter', usernameVariable: 'VCENTER_USER', passwordVariable: 'VCENTER_PASS')]) {
-                            runAudit()
-                        }
-                    } else {
+                    withCredentials([usernamePassword(credentialsId: 'user_vCenter', usernameVariable: 'VCENTER_USER', passwordVariable: 'VCENTER_PASS')]) {
                         runAudit()
                     }
                 }
