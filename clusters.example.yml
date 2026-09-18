@@ -1,0 +1,9 @@
+clusters:
+  - name: AG01
+    nodes:
+      - SQLNODE01
+      - SQLNODE02
+  - name: AG02
+    nodes:
+      - SQLNODE03
+      - SQLNODE04

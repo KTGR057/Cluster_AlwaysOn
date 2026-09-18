@@ -1,0 +1,65 @@
+# Inventario funcional. El campo nombre es el identificador del Always On,
+# no necesariamente el nombre del ClusterComputeResource en vCenter.
+clusters:
+  - nombre: DG
+    nodos:
+      - BOPVSVWSSDGN01
+      - BOPVSVWSSDGN02
+      - MEPVSVWSSDGN01
+
+  - nombre: MUNICIPIOS_CILES
+    nodos:
+      - BOPVSVWSSMCP
+      - MEPVSVWSSMCP
+
+  - nombre: CONTADOS_MASIVOS
+    nodos:
+      - BOPVSVWSSPVT01
+      - MEPVSVWSSPVT01
+
+  - nombre: FACTURACION_ELECTRONICA
+    nodos:
+      - SERV-BTABDFAC01
+      - SERV-MDEBDFAC02
+      - SERV-MDEBDFAC03
+
+  - nombre: DISTRIBUIDOR_01
+    etiqueta: DISTRIBUIDOR
+    nodos:
+      - BOPVSVWSDBDST01
+      - MEPVSVWSDBDST02
+
+  - nombre: REPORTES
+    nodos:
+      - BOPVSVWSSDER02
+      - mepvsvwssder01
+      - MEPVSVWSSDER02
+
+  - nombre: MDM
+    nodos:
+      - BOPVSVWSSMDM01
+      - MEPVSVWSSMDM01
+      - MEPVSVWSSMDM02
+
+  - nombre: RETAIL
+    nodos:
+      - BOPVSVWSSRET01
+      - MEPVSVWSSRET01
+      - MEPVSVWSSRET02
+
+  - nombre: SICLINET
+    nodos:
+      - BOPVSVWSSSIS01
+      - MEPVSVWSSSIS01
+      - MEPVSVWSSSIS02
+
+  - nombre: DISTRIBUIDOR_02
+    etiqueta: DISTRIBUIDOR
+    nodos:
+      - BOPVSVWSSDIS01
+      - MEPVSVWSSDIS01
+
+  - nombre: CTX
+    nodos:
+      - BOPVSVWSSCTX01
+      - MEPVSVWSSCTX02

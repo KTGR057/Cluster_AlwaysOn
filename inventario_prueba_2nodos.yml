@@ -1,0 +1,7 @@
+# Inventario reducido para la primera prueba del pipeline.
+clusters:
+  - nombre: DG_PRUEBA
+    etiqueta: DG
+    nodos:
+      - BOPVSVWSSDGN01
+      - BOPVSVWSSDGN02

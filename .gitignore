@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Auditoria generada localmente
+artifacts/
+artifacts-offline/
+*.json
+*.html
+
+# Jenkins y archivos temporales
+clusters.yml
+*.log
+
+# IDE y sistema operativo
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
