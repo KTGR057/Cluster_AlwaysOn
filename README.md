@@ -7,7 +7,7 @@ Pipeline Jenkins de solo lectura para comparar nodos de clusters SQL Server Alwa
 El workspace `Cluster_AlwaysOn` estaba vacio. Se reutilizaron los patrones encontrados en `../ansible-vm-provisioning`:
 
 - Agente `k8s-ansible-arus` y contenedor `ansible`.
-- Credencial Jenkins `user_vCenter` mediante `withCredentials`.
+- Credencial Jenkins `vcenter_admin` mediante `withCredentials`.
 - Versiones `ansible-core<2.17`, `ansible<10.0` y `pyvmomi==8.0.3.0.1`.
 - Mapeo de vCenters existente: BTA `10.10.170.159`, MDE `10.10.144.159`.
 
@@ -48,7 +48,7 @@ Jenkins archiva en `artifacts/`:
 
 ## Ejecucion
 
-El pipeline ejecuta la consulta real contra ambos vCenter. La validación de certificados TLS queda desactivada para mantener compatibilidad con el pipeline existente; la credencial `user_vCenter` debe tener permisos de lectura en ambos.
+El pipeline ejecuta la consulta real contra ambos vCenter. La validación de certificados TLS queda desactivada para mantener compatibilidad con el pipeline existente; la credencial `vcenter_admin` debe tener permisos de lectura en ambos.
 
 Se reportan CPU (vCPU, sockets, cores/socket, reservas y limites), memoria (asignacion, reserva porcentual y limite), discos y controladores SCSI, aprovisionamiento, datastore/politica, adaptadores y red, hosts fisicos y reglas DRS.
 
@@ -68,7 +68,7 @@ Estas son comprobaciones de referencia, no sustituyen la validacion de la arquit
 
 ## Permisos y seguridad
 
-La credencial `user_vCenter` debe tener permisos de lectura sobre VMs, datastores, redes, clusters DRS y reglas. No se requieren permisos de escritura. La contrasena se inyecta con `withCredentials` y se consume por variables de entorno; no se escribe en archivos ni argumentos de proceso.
+La credencial `vcenter_admin` debe tener permisos de lectura sobre VMs, datastores, redes, clusters DRS y reglas. No se requieren permisos de escritura. La contrasena se inyecta con `withCredentials` y se consume por variables de entorno; no se escribe en archivos ni argumentos de proceso.
 
 Por compatibilidad con el repositorio de aprovisionamiento, el pipeline deja `VALIDATE_CERTS` desactivado por defecto. En produccion debe instalarse la CA de vCenter en la imagen del contenedor y ejecutarse con `VALIDATE_CERTS=true`.
 

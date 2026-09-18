@@ -74,7 +74,7 @@ pipeline {
                             '''
                         }
                     }
-                    withCredentials([usernamePassword(credentialsId: 'user_vCenter', usernameVariable: 'VCENTER_USER', passwordVariable: 'VCENTER_PASS')]) {
+                    withCredentials([usernamePassword(credentialsId: 'vcenter_admin', usernameVariable: 'VCENTER_USER', passwordVariable: 'VCENTER_PASS')]) {
                         runAudit()
                     }
                 }
