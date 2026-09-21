@@ -69,6 +69,14 @@ Para cargas criticas SQL Server, el auditor aplica adicionalmente estas reglas:
 - **E/S:** se revisan Thick Eager Zeroed, controladoras PVSCSI/NVMe, separacion de buses para SO/datos/logs/TempDB y datastores compartidos.
 - **Red y tiempo:** se informa adaptador, VLAN y MTU; se recomienda MTU 9000 solo cuando la red de replicacion lo soporte extremo a extremo. La sincronizacion NTP/dominio se deja como verificacion del guest porque vSphere no expone su estado real mediante esta consulta.
 
+### Datos necesarios para MTU
+
+La VM solo identifica el portgroup. El usuario configurado es `vcenter_admin` y tiene permisos administrativos, por lo que el auditor no espera una restriccion de permisos. Busca el `portgroupKey` del adaptador y consulta el `maxMtu` del vDS. Si la red es un portgroup estandar o la API no expone el valor en el objeto consultado, el reporte indicara `No expuesto por API`; en ese caso se debe confirmar manualmente en vCenter el MTU del portgroup, vDS, uplinks, switches fisicos y la interfaz de replicacion SQL. No se requiere una IP adicional para la consulta de vSphere.
+
+### Interpretacion de memoria y controladoras
+
+La reserva se valida comparando exactamente `Memory Reservation` contra `Memory assigned`, en MB. Por ejemplo, una VM de 530 GB con `542720 MB` asignados y `542720 MB` reservados debe aparecer como `100% LOCKED`; si la diferencia es mayor que cero, se marca como incumplimiento. La captura muestra ademas cuatro controladoras `VMware Paravirtual`, que corresponden a PVSCSI y cumplen el tipo recomendado; el reporte debe listar sus buses y no generar el hallazgo de controladora incorrecta.
+
 El JSON conserva `score`, `status` (`RED`, `YELLOW` o `GREEN`) y cada hallazgo incluye parametro, valor actual, valor esperado y remediacion sugerida. El HTML presenta la misma informacion en una matriz visual.
 
 ## Recomendaciones evaluadas

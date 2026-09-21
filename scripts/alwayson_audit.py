@@ -73,11 +73,19 @@ def network_vlan(network):
         return vlan_id
     if vlan_spec is not None:
         return type(vlan_spec).__name__.replace("Spec", "")
-    return "See vCenter"
+    return "No expuesto por API"
 
 
 def network_mtu(network):
-    return prop(network, "config.maxMtu", None) or prop(network, "config.uplinkPortPolicy.maxMtu", None) or "Unknown"
+    """Read MTU from a distributed switch or portgroup when vSphere exposes it."""
+    switch = prop(network, "config.distributedVirtualSwitch", None)
+    return (
+        prop(switch, "config.maxMtu", None)
+        or prop(switch, "summary.config.maxMtu", None)
+        or prop(network, "config.maxMtu", None)
+        or prop(network, "config.defaultPortConfig.maxMtu", None)
+        or "No expuesto por API"
+    )
 
 
 def allocation_value(allocation, field, unlimited=-1):
@@ -85,7 +93,20 @@ def allocation_value(allocation, field, unlimited=-1):
     return unlimited if value is None else value
 
 
-def vm_snapshot(vm):
+def resolve_network(content, backing):
+    network = prop(backing, "network", None)
+    if network is not None or content is None:
+        return network
+    portgroup_key = prop(backing, "port.portgroupKey", None)
+    if not portgroup_key:
+        return None
+    for portgroup in all_objects(content, vim.dvs.DistributedVirtualPortgroup):
+        if getattr(portgroup, "key", None) == portgroup_key:
+            return portgroup
+    return None
+
+
+def vm_snapshot(vm, content=None):
     config = vm.config
     devices = list(config.hardware.device) if config and config.hardware else []
     disks = []
@@ -110,11 +131,11 @@ def vm_snapshot(vm):
             })
         elif isinstance(device, vim.vm.device.VirtualEthernetCard):
             backing = device.backing
-            network = prop(backing, "network", None)
+            network = resolve_network(content, backing)
             networks.append({
                 "label": device.deviceInfo.label if device.deviceInfo else str(device.key),
                 "adapter": type(device).__name__.replace("Virtual", ""),
-                "network": prop(backing, "network.name", None) or getattr(backing, "deviceName", "Unknown"),
+                "network": prop(network, "name", None) or getattr(backing, "deviceName", "Unknown"),
                 "vlan": network_vlan(network),
                 "mtu": network_mtu(network),
             })
@@ -122,6 +143,9 @@ def vm_snapshot(vm):
                         for device in devices if isinstance(device, vim.vm.device.VirtualSCSIController)}
     for disk in disks:
         disk["controller"] = controller_names.get(disk["controller_key"], "Unknown")
+    assigned_memory = config.hardware.memoryMB
+    reserved_memory = allocation_value(config.memoryAllocation, "reservation", 0)
+    reservation_delta = max(assigned_memory - reserved_memory, 0)
     return {
         "name": vm.name,
         "moid": vm._moId,
@@ -136,9 +160,11 @@ def vm_snapshot(vm):
             "hot_add": bool(getattr(config, "cpuHotAddEnabled", False)),
         },
         "memory": {
-            "assigned_mb": config.hardware.memoryMB,
-            "reservation_mb": allocation_value(config.memoryAllocation, "reservation", 0),
-            "reservation_percent": reservation_percent(vm),
+            "assigned_mb": assigned_memory,
+            "reservation_mb": reserved_memory,
+            "reservation_percent": round(reserved_memory / assigned_memory * 100, 1) if assigned_memory else 0,
+            "reservation_delta_mb": reservation_delta,
+            "reservation_status": "100% LOCKED" if reservation_delta == 0 else "PARTIAL",
             "limit_mb": allocation_value(config.memoryAllocation, "limit"),
             "hot_add": bool(getattr(config, "memoryHotAddEnabled", False)),
         },
@@ -222,13 +248,13 @@ def add_finding(findings, severity, message, parameter, actual=None, expected=No
     remediations = {
         "cpu.hot_add": "PowerCLI: Get-VM VM | Set-VM -CpuHotAddEnabled:$false -Confirm:$false",
         "memory.hot_add": "PowerCLI: Get-VM VM | Set-VM -MemoryHotAddEnabled:$false -Confirm:$false",
-        "memory.reservation_percent": "Configurar Memory Reservation igual a la memoria asignada y Memory Limit = Unlimited.",
+        "memory.reservation_percent": "Activar Reserve all guest memory (All locked), dejando Memory Reservation igual a la RAM asignada y Memory Limit = Unlimited.",
         "cpu.limit_mhz": "Configurar CPU Limit = Unlimited y conservar Reservation = 0 salvo estandar aprobado.",
         "memory.limit_mb": "Configurar Memory Limit = Unlimited en la configuracion de la VM.",
         "storage.provisioning": "Migrar el VMDK a Thick Eager Zeroed durante una ventana de mantenimiento.",
         "storage.controllers": "Agregar controladoras PVSCSI/NVMe separadas para SO, datos, logs y TempDB; validar dependencias SQL.",
         "network.adapter": "PowerCLI: Get-VM VM | Get-NetworkAdapter | Set-NetworkAdapter -Type Vmxnet3 -Confirm:$false",
-        "network.mtu": "Configurar MTU extremo a extremo en portgroup, vDS, uplinks y red de replicacion; validar jumbo frames.",
+        "network.mtu": "Consultar el vDS/portgroup y configurar MTU extremo a extremo en portgroup, vDS, uplinks y red de replicacion; validar jumbo frames.",
         "platform.virtual_hardware": "Actualizar VMware Tools y hardware virtual en una ventana controlada, validando compatibilidad del guest.",
         "platform.tools": "Actualizar/reparar VMware Tools y confirmar estado toolsOk/toolsOld.",
         "platform.time_sync": "Configurar NTP en el guest o sincronizacion de dominio; no mezclar VMware Tools periodic sync con NTP activo.",
@@ -251,8 +277,8 @@ def compare_cluster(cluster, vms, drs):
         add_finding(findings, "HIGH", "Existe limite de CPU", "cpu.limit_mhz", dict(zip(names, [vm["cpu"]["limit_mhz"] for vm in vms])), "unlimited")
     for field in ("assigned_mb", "reservation_percent", "limit_mb"):
         values = [vm["memory"][field] for vm in vms]
-        if field == "reservation_percent" and any(value < 100 for value in values):
-            add_finding(findings, "HIGH", "La memoria no tiene reserva del 100%", "memory.reservation_percent", dict(zip(names, values)), 100)
+        if field == "reservation_percent" and any(vm["memory"]["reservation_delta_mb"] > 0 for vm in vms):
+            add_finding(findings, "HIGH", "La memoria no tiene reserva estricta del 100% (Reserve all guest memory)", "memory.reservation_percent", {vm["name"]: {"assigned_mb": vm["memory"]["assigned_mb"], "reservation_mb": vm["memory"]["reservation_mb"], "delta_mb": vm["memory"]["reservation_delta_mb"], "status": vm["memory"]["reservation_status"]} for vm in vms}, "reservation_mb igual a assigned_mb; 100% LOCKED")
         elif field == "limit_mb" and any(value not in (-1, None) for value in values):
             add_finding(findings, "HIGH", "Existe limite de memoria; puede provocar contention", "memory.limit_mb", dict(zip(names, values)), "unlimited")
         elif len(set(values)) > 1:
@@ -263,13 +289,13 @@ def compare_cluster(cluster, vms, drs):
         for disk in vm["disks"]:
             if disk["provisioning"] != "Thick Eager Zeroed":
                 add_finding(findings, "MEDIUM", "Disco no es Thick Eager Zeroed", "storage.provisioning", {vm["name"]: disk["provisioning"]}, "Thick Eager Zeroed")
-        if not vm["controllers"] or any("ParaVirtual" not in controller["type"] and "NVMe" not in controller["type"] for controller in vm["controllers"]):
+        if not vm["controllers"] or any(not ("ParaSCSI" in controller["type"] or "ParaVirtual" in controller["type"] or "NVMe" in controller["type"]) for controller in vm["controllers"]):
             add_finding(findings, "MEDIUM", "Controladora distinta de PVSCSI/NVMe", "storage.controllers", {vm["name"]: vm["controllers"]}, "PVSCSI o NVMe")
         for network in vm["networks"]:
             if network["adapter"] != "Vmxnet3":
                 add_finding(findings, "MEDIUM", "Adaptador de red distinto de VMXNET3", "network.adapter", {vm["name"]: network["adapter"]}, "Vmxnet3")
-            if network["mtu"] == "Unknown":
-                add_finding(findings, "MEDIUM", "No fue posible confirmar el MTU del portgroup", "network.mtu", {vm["name"]: network["mtu"]}, "9000 para replicacion si la red lo soporta")
+            if network["mtu"] in ("Unknown", "No expuesto por API"):
+                add_finding(findings, "MEDIUM", "El MTU no esta expuesto en el objeto de red consultado", "network.mtu", {vm["name"]: network["mtu"]}, "9000 para replicacion si la red lo soporta")
     datastore_sets = {vm["name"]: sorted({disk["datastore"] for disk in vm["disks"]}) for vm in vms}
     if len({tuple(value) for value in datastore_sets.values()}) == 1 and len(vms) > 1:
         add_finding(findings, "HIGH", "Los nodos comparten la misma ubicacion de datastore", "storage.datastore_affinity", datastore_sets, "datastores/failure domains distintos")
@@ -278,6 +304,9 @@ def compare_cluster(cluster, vms, drs):
         add_finding(findings, "MEDIUM", "Version de hardware virtual inconsistente", "platform.virtual_hardware", dict(zip(names, platform_versions)), "igual en todos los nodos")
     if any(vm["platform"]["tools_status"] not in ("toolsOk", "guestToolsCurrent", "Unknown") for vm in vms):
         add_finding(findings, "MEDIUM", "Estado de VMware Tools requiere revision", "platform.tools", dict(zip(names, [vm["platform"]["tools_status"] for vm in vms])), "toolsOk/toolsCurrent")
+    tools_versions = [vm["platform"]["tools_version"] for vm in vms]
+    if len(set(tools_versions)) > 1 and "Unknown" not in tools_versions:
+        add_finding(findings, "MEDIUM", "Version de VMware Tools inconsistente entre nodos", "platform.tools", dict(zip(names, tools_versions)), "misma version compatible en todos los nodos")
     controller_buses = {vm["name"]: sorted(controller["bus_number"] for controller in vm["controllers"]) for vm in vms}
     if any(len(buses) < 2 for buses in controller_buses.values()):
         add_finding(findings, "MEDIUM", "La VM no tiene multiples controladoras para separar SO, datos, logs y TempDB", "storage.controllers", controller_buses, "al menos 2; idealmente separar cargas en 0/1/2/3")
@@ -299,7 +328,7 @@ def mock_vm(name, index):
         "power_state": "poweredOn",
         "host": "esxi-offline-%d" % (index % 2 + 1),
         "cpu": {"vcpus": 8 if index == 1 else 4, "sockets": 1, "cores_per_socket": 4, "reservation_mhz": 0, "limit_mhz": -1, "hot_add": False},
-        "memory": {"assigned_mb": 32768, "reservation_mb": 16384 if index == 1 else 32768, "reservation_percent": 50 if index == 1 else 100, "limit_mb": -1, "hot_add": False},
+        "memory": {"assigned_mb": 32768, "reservation_mb": 16384 if index == 1 else 32768, "reservation_percent": 50 if index == 1 else 100, "reservation_delta_mb": 16384 if index == 1 else 0, "reservation_status": "PARTIAL" if index == 1 else "100% LOCKED", "limit_mb": -1, "hot_add": False},
         "disks": [{"label": "Hard disk 1", "capacity_gb": 100, "controller_key": 1000, "controller": "SCSI controller 0", "provisioning": "Thin", "datastore": "DS-OFFLINE", "storage_policy": "Unspecified"}],
         "controllers": [{"label": "SCSI controller 0", "type": "ParaVirtualSCSIController", "bus_number": 0}],
         "networks": [{"label": "Network adapter 1", "adapter": "Vmxnet3", "network": "VLAN-OFFLINE", "vlan": 100, "mtu": 9000}],
@@ -361,7 +390,7 @@ def html_report(report):
         for vm in cluster["nodes"]:
             disks = ", ".join(d["provisioning"] for d in vm["disks"])
             networks = ", ".join(n["adapter"] + " / " + str(n["network"]) for n in vm["networks"])
-            node_cards.append("<article class='node-card'><div class='node-heading'><div><span class='eyebrow'>Nodo</span><h3>%s</h3></div><span class='site'>%s</span></div><div class='node-grid'><div><span>Host ESXi</span><strong>%s</strong></div><div><span>CPU</span><strong>%s vCPU</strong></div><div><span>RAM</span><strong>%s GB</strong></div><div><span>Reserva</span><strong>%s%%</strong></div><div><span>Hardware</span><strong>%s</strong></div><div><span>Tools</span><strong>%s</strong></div></div><div class='node-footer'><span>Discos: %s</span><span>Red: %s</span></div></article>" % tuple(html.escape(str(x)) for x in [vm["name"], vm.get("vcenter", "offline"), vm["host"], vm["cpu"]["vcpus"], round(vm["memory"]["assigned_mb"] / 1024, 1), vm["memory"]["reservation_percent"], vm["platform"]["virtual_hardware"], vm["platform"]["tools_status"], disks or "No informado", networks or "No informado"]))
+            node_cards.append("<article class='node-card'><div class='node-heading'><div><span class='eyebrow'>Nodo</span><h3>%s</h3></div><span class='site'>%s</span></div><div class='node-grid'><div><span>Host ESXi</span><strong>%s</strong></div><div><span>CPU</span><strong>%s vCPU</strong></div><div><span>RAM asignada</span><strong>%s GB</strong></div><div><span>Reserva RAM</span><strong>%s MB (%s%%)</strong></div><div><span>Estado reserva</span><strong>%s</strong></div><div><span>Hardware</span><strong>%s</strong></div><div><span>Tools</span><strong>%s</strong></div></div><div class='node-footer'><span>Discos: %s</span><span>Red: %s</span></div></article>" % tuple(html.escape(str(x)) for x in [vm["name"], vm.get("vcenter", "offline"), vm["host"], vm["cpu"]["vcpus"], round(vm["memory"]["assigned_mb"] / 1024, 1), vm["memory"]["reservation_mb"], vm["memory"]["reservation_percent"], vm["memory"]["reservation_status"], vm["platform"]["virtual_hardware"], vm["platform"]["tools_status"], disks or "No informado", networks or "No informado"]))
         rows.append("<section class='cluster-section'><div class='cluster-header'><div><span class='eyebrow'>Cluster Always On</span><h2>%s</h2><p>%s nodos · %s host(s) fisico(s)</p></div><div class='score-ring %s'><strong>%s</strong><span>/100</span><small>%s</small></div></div><div class='node-cards'>%s</div><h3 class='section-title'>Matriz de hallazgos y remediacion</h3><div class='finding-list'>" % (html.escape(cluster["name"]), node_count, len(performance["physical_hosts"]), performance["status"].lower(), performance["score"], performance["status"], "".join(node_cards)))
         for finding in cluster["findings"]:
             severity = finding.get("severity", "INFO")
@@ -407,7 +436,7 @@ def main():
             vms = []
             findings = []
             for node in cluster["nodes"]:
-                snapshot = vm_snapshot(find_vm(contents[node["vcenter"]], node["name"]))
+                snapshot = vm_snapshot(find_vm(contents[node["vcenter"]], node["name"]), contents[node["vcenter"]])
                 snapshot["vcenter"] = node["vcenter"]
                 vms.append(snapshot)
             for vcenter, content in contents.items():
