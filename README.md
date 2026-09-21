@@ -63,9 +63,11 @@ Se reportan CPU (vCPU, sockets, cores/socket, reservas y limites), memoria (asig
 Para cargas criticas SQL Server, el auditor aplica adicionalmente estas reglas:
 
 - **vNUMA:** vCPU, sockets y cores por socket deben ser identicos; CPU Hot-Plug debe estar deshabilitado.
+- **CPU Shares:** el nivel y valor deben ser homogeneos entre nodos. `Normal` es la recomendacion por defecto; `High` solo debe usarse con una politica formal de prioridad en resource pools.
 - **Memoria:** la reserva debe ser del 100% de la RAM asignada y Memory Limit debe estar en Unlimited; Memory Hot-Add debe estar deshabilitado.
 - **Hardware virtual:** la VM Hardware Version debe ser igual entre nodos.
 - **VMware Tools:** se informa version y estado de Tools por VM y se marca inconsistencia o estado no saludable. La condicion de "ultima version compatible" requiere definir una baseline corporativa; sin ella el auditor no inventa una version objetivo.
+- **Identidad del OS:** se comparan el `Guest OS` configurado en la VM y el `guestFullName` reportado por VMware Tools. El reporte muestra ambos valores, estado `COINCIDE`, `DIFIERE` o `NO_CONCLUSIVO`, y recomienda sincronizar la configuración de vCenter/Tools cuando sea necesario.
 - **E/S:** se revisan Thick Eager Zeroed, controladoras PVSCSI/NVMe, separacion de buses para SO/datos/logs/TempDB y datastores compartidos.
 - **Red y tiempo:** se informa adaptador, VLAN y MTU; se recomienda MTU 9000 solo cuando la red de replicacion lo soporte extremo a extremo. La sincronizacion NTP/dominio se deja como verificacion del guest porque vSphere no expone su estado real mediante esta consulta.
 
@@ -83,7 +85,7 @@ El JSON conserva `score`, `status` (`RED`, `YELLOW` o `GREEN`) y cada hallazgo i
 
 - Misma topologia de CPU y memoria en todos los nodos.
 - Reserva de memoria del 100% para SQL Server y limite de memoria ilimitado.
-- Thick Eager Zeroed para discos de datos cuando el estandar de rendimiento lo requiera.
+- Tipo de aprovisionamiento Thin/Thick informativo; no afecta el score porque puede variar intencionalmente por volumen.
 - Controladores PVSCSI y distribucion de discos entre controladores.
 - Adaptadores VMXNET3 y redes/VLAN consistentes.
 - Regla DRS VM-VM de anti-afinidad habilitada para todos los nodos.

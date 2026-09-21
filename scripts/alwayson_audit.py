@@ -24,6 +24,10 @@ VCENTERS = {
     "vCenter_MDE": ("10.10.144.159", "dhcimdedc"),
 }
 
+# Baseline supplied for the physical hosts: 2 sockets x 32 physical cores.
+HOST_NUMA_CORES = 32
+HOST_TOTAL_CORES = 64
+
 
 def prop(obj, path, default=None):
     value = obj
@@ -93,6 +97,72 @@ def allocation_value(allocation, field, unlimited=-1):
     return unlimited if value is None else value
 
 
+def cpu_recommendation(vm):
+    vcpus = vm["cpu"]["vcpus"]
+    current = "%s socket(s) x %s core(s)" % (vm["cpu"]["sockets"], vm["cpu"]["cores_per_socket"])
+    if vcpus <= HOST_NUMA_CORES:
+        recommended_sockets = 1
+        recommended_cores = vcpus
+        topology_status = "ALINEADA" if (vm["cpu"]["sockets"], vm["cpu"]["cores_per_socket"]) == (recommended_sockets, recommended_cores) else "AJUSTAR"
+        message = "%s: actual %s; recomendado 1 socket x %s cores para permanecer dentro de un nodo NUMA de %s cores." % (vm["name"], current, recommended_cores, HOST_NUMA_CORES)
+    elif vcpus <= HOST_TOTAL_CORES:
+        recommended_sockets = 2
+        recommended_cores = (vcpus + 1) // 2
+        topology_status = "ALINEADA" if (vm["cpu"]["sockets"], vm["cpu"]["cores_per_socket"]) == (recommended_sockets, recommended_cores) else "AJUSTAR"
+        message = "%s: actual %s; recomendado %s sockets x %s cores, distribuido sobre los dos nodos NUMA de %s cores." % (vm["name"], current, recommended_sockets, recommended_cores, HOST_NUMA_CORES)
+    else:
+        recommended_sockets = None
+        recommended_cores = None
+        topology_status = "REVISAR"
+        message = "%s: %s vCPU supera los %s cores fisicos conocidos del host; requiere diseno NUMA especifico." % (vm["name"], vcpus, HOST_TOTAL_CORES)
+    if vm["cpu"]["hot_add"]:
+        topology_status = "AJUSTAR"
+        message += " CPU Hot-Plug debe estar deshabilitado."
+    return {
+        "current": current,
+        "recommended_sockets": recommended_sockets,
+        "recommended_cores_per_socket": recommended_cores,
+        "status": topology_status,
+        "message": message,
+        "host_baseline": "2 sockets x 32 cores; %s cores fisicos; HT no se usa para dimensionar vNUMA" % HOST_TOTAL_CORES,
+    }
+
+
+def shares_snapshot(allocation):
+    shares = getattr(allocation, "shares", None)
+    level = str(getattr(shares, "level", "normal") or "normal").lower()
+    shares_value = getattr(shares, "shares", None)
+    return {"level": level, "shares": shares_value}
+
+
+def normalize_os_name(value):
+    if not value:
+        return "Unknown"
+    return " ".join(str(value).lower().replace("microsoft", "").split())
+
+
+def os_snapshot(vm, config):
+    configured = getattr(config, "guestFullName", None) or "Unknown"
+    tools_reported = prop(vm, "guest.guestFullName", None) or "Unknown"
+    configured_key = normalize_os_name(configured)
+    tools_key = normalize_os_name(tools_reported)
+    if "unknown" in (configured_key, tools_key):
+        status = "NO_CONCLUSIVO"
+        recommendation = "Verificar VMware Tools y actualizar el inventario del sistema operativo en vCenter."
+    elif configured_key == tools_key:
+        status = "COINCIDE"
+        recommendation = "No requiere ajuste; mantener VMware Tools actualizado y el inventario sincronizado."
+    else:
+        status = "DIFIERE"
+        recommendation = "Confirmar el OS real dentro del guest, actualizar VMware Tools y corregir el Guest OS configurado en vCenter si corresponde."
+    return {
+        "configured": configured,
+        "tools_reported": tools_reported,
+        "status": status,
+        "recommendation": recommendation,
+    }
+
+
 def resolve_network(content, backing):
     network = prop(backing, "network", None)
     if network is not None or content is None:
@@ -158,6 +228,7 @@ def vm_snapshot(vm, content=None):
             "reservation_mhz": allocation_value(config.cpuAllocation, "reservation", 0),
             "limit_mhz": allocation_value(config.cpuAllocation, "limit"),
             "hot_add": bool(getattr(config, "cpuHotAddEnabled", False)),
+            "shares": shares_snapshot(config.cpuAllocation),
         },
         "memory": {
             "assigned_mb": assigned_memory,
@@ -174,6 +245,7 @@ def vm_snapshot(vm, content=None):
             "tools_status": prop(vm, "guest.toolsVersionStatus2", "Unknown"),
             "time_sync": "Not exposed by vSphere API; verify guest NTP/domain",
         },
+        "os": os_snapshot(vm, config),
         "disks": disks,
         "controllers": controllers,
         "networks": networks,
@@ -250,14 +322,15 @@ def add_finding(findings, severity, message, parameter, actual=None, expected=No
         "memory.hot_add": "PowerCLI: Get-VM VM | Set-VM -MemoryHotAddEnabled:$false -Confirm:$false",
         "memory.reservation_percent": "Activar Reserve all guest memory (All locked), dejando Memory Reservation igual a la RAM asignada y Memory Limit = Unlimited.",
         "cpu.limit_mhz": "Configurar CPU Limit = Unlimited y conservar Reservation = 0 salvo estandar aprobado.",
+        "cpu.shares": "Homologar CPU Shares en todos los nodos. Usar Normal por defecto; usar High solo con una politica formal de resource pool.",
         "memory.limit_mb": "Configurar Memory Limit = Unlimited en la configuracion de la VM.",
-        "storage.provisioning": "Migrar el VMDK a Thick Eager Zeroed durante una ventana de mantenimiento.",
         "storage.controllers": "Agregar controladoras PVSCSI/NVMe separadas para SO, datos, logs y TempDB; validar dependencias SQL.",
         "network.adapter": "PowerCLI: Get-VM VM | Get-NetworkAdapter | Set-NetworkAdapter -Type Vmxnet3 -Confirm:$false",
         "network.mtu": "Consultar el vDS/portgroup y configurar MTU extremo a extremo en portgroup, vDS, uplinks y red de replicacion; validar jumbo frames.",
         "platform.virtual_hardware": "Actualizar VMware Tools y hardware virtual en una ventana controlada, validando compatibilidad del guest.",
         "platform.tools": "Actualizar/reparar VMware Tools y confirmar estado toolsOk/toolsOld.",
         "platform.time_sync": "Configurar NTP en el guest o sincronizacion de dominio; no mezclar VMware Tools periodic sync con NTP activo.",
+        "os.identity": "Confirmar el OS dentro del guest, actualizar VMware Tools y corregir el Guest OS configurado en vCenter si corresponde.",
         "drs.anti_affinity": "Crear regla DRS VM-VM Separate Virtual Machines con todos los nodos del grupo.",
         "storage.datastore_affinity": "Ubicar los nodos en datastores/failure domains fisicos distintos o documentar la excepcion.",
     }
@@ -267,6 +340,10 @@ def add_finding(findings, severity, message, parameter, actual=None, expected=No
 def compare_cluster(cluster, vms, drs):
     findings = list(drs)
     names = [vm["name"] for vm in vms]
+    for vm in vms:
+        vm["cpu"]["recommendation"] = cpu_recommendation(vm)
+        if vm["cpu"]["recommendation"]["status"] != "ALINEADA":
+            add_finding(findings, "HIGH", "Topologia de sockets/cores no alineada con NUMA fisico", "cpu.topology", {vm["name"]: vm["cpu"]["recommendation"]["current"]}, vm["cpu"]["recommendation"]["message"])
     for field in ("vcpus", "sockets", "cores_per_socket"):
         values = [vm["cpu"][field] for vm in vms]
         if len(set(values)) > 1:
@@ -275,6 +352,10 @@ def compare_cluster(cluster, vms, drs):
         add_finding(findings, "HIGH", "CPU Hot-Add habilitado; puede alterar la topologia vNUMA", "cpu.hot_add", dict(zip(names, [vm["cpu"]["hot_add"] for vm in vms])), False)
     if any(vm["cpu"]["limit_mhz"] not in (-1, 0, None) for vm in vms):
         add_finding(findings, "HIGH", "Existe limite de CPU", "cpu.limit_mhz", dict(zip(names, [vm["cpu"]["limit_mhz"] for vm in vms])), "unlimited")
+    share_levels = [vm["cpu"]["shares"]["level"] for vm in vms]
+    share_values = [vm["cpu"]["shares"]["shares"] for vm in vms]
+    if len(set(share_levels)) > 1 or len(set(share_values)) > 1:
+        add_finding(findings, "MEDIUM", "CPU Shares inconsistente entre nodos; la prioridad bajo contencion no es homogenea", "cpu.shares", dict(zip(names, [vm["cpu"]["shares"] for vm in vms])), "mismo nivel y valor en todos los nodos; Normal por defecto")
     for field in ("assigned_mb", "reservation_percent", "limit_mb"):
         values = [vm["memory"][field] for vm in vms]
         if field == "reservation_percent" and any(vm["memory"]["reservation_delta_mb"] > 0 for vm in vms):
@@ -286,9 +367,11 @@ def compare_cluster(cluster, vms, drs):
     if any(vm["memory"]["hot_add"] for vm in vms):
         add_finding(findings, "HIGH", "Memory Hot-Add habilitado", "memory.hot_add", dict(zip(names, [vm["memory"]["hot_add"] for vm in vms])), False)
     for vm in vms:
-        for disk in vm["disks"]:
-            if disk["provisioning"] != "Thick Eager Zeroed":
-                add_finding(findings, "MEDIUM", "Disco no es Thick Eager Zeroed", "storage.provisioning", {vm["name"]: disk["provisioning"]}, "Thick Eager Zeroed")
+        if vm["os"]["status"] == "DIFIERE":
+            add_finding(findings, "MEDIUM", "El OS configurado en vCenter difiere del OS reportado por VMware Tools", "os.identity", {vm["name"]: {"config_file": vm["os"]["configured"], "vmware_tools": vm["os"]["tools_reported"]}}, "Ambas fuentes deben identificar el mismo sistema operativo")
+        elif vm["os"]["status"] == "NO_CONCLUSIVO":
+            add_finding(findings, "MEDIUM", "No fue posible comparar el OS configurado con el reportado por VMware Tools", "os.identity", {vm["name"]: {"config_file": vm["os"]["configured"], "vmware_tools": vm["os"]["tools_reported"]}}, "Ambas fuentes disponibles y coincidentes")
+    for vm in vms:
         if not vm["controllers"] or any(not ("ParaSCSI" in controller["type"] or "ParaVirtual" in controller["type"] or "NVMe" in controller["type"]) for controller in vm["controllers"]):
             add_finding(findings, "MEDIUM", "Controladora distinta de PVSCSI/NVMe", "storage.controllers", {vm["name"]: vm["controllers"]}, "PVSCSI o NVMe")
         for network in vm["networks"]:
@@ -327,12 +410,13 @@ def mock_vm(name, index):
         "moid": "offline-%s" % index,
         "power_state": "poweredOn",
         "host": "esxi-offline-%d" % (index % 2 + 1),
-        "cpu": {"vcpus": 8 if index == 1 else 4, "sockets": 1, "cores_per_socket": 4, "reservation_mhz": 0, "limit_mhz": -1, "hot_add": False},
+        "cpu": {"vcpus": 8 if index == 1 else 4, "sockets": 1, "cores_per_socket": 4, "reservation_mhz": 0, "limit_mhz": -1, "hot_add": False, "shares": {"level": "normal", "shares": 4000}},
         "memory": {"assigned_mb": 32768, "reservation_mb": 16384 if index == 1 else 32768, "reservation_percent": 50 if index == 1 else 100, "reservation_delta_mb": 16384 if index == 1 else 0, "reservation_status": "PARTIAL" if index == 1 else "100% LOCKED", "limit_mb": -1, "hot_add": False},
         "disks": [{"label": "Hard disk 1", "capacity_gb": 100, "controller_key": 1000, "controller": "SCSI controller 0", "provisioning": "Thin", "datastore": "DS-OFFLINE", "storage_policy": "Unspecified"}],
         "controllers": [{"label": "SCSI controller 0", "type": "ParaVirtualSCSIController", "bus_number": 0}],
         "networks": [{"label": "Network adapter 1", "adapter": "Vmxnet3", "network": "VLAN-OFFLINE", "vlan": 100, "mtu": 9000}],
         "platform": {"virtual_hardware": "vmx-21", "tools_version": "offline", "tools_status": "Unknown", "time_sync": "Not evaluated in offline mode"},
+        "os": {"configured": "Windows Server (offline)", "tools_reported": "Windows Server (offline)", "status": "COINCIDE", "recommendation": "No requiere ajuste en modo offline."},
     }
 
 
@@ -390,7 +474,11 @@ def html_report(report):
         for vm in cluster["nodes"]:
             disks = ", ".join(d["provisioning"] for d in vm["disks"])
             networks = ", ".join(n["adapter"] + " / " + str(n["network"]) for n in vm["networks"])
-            node_cards.append("<article class='node-card'><div class='node-heading'><div><span class='eyebrow'>Nodo</span><h3>%s</h3></div><span class='site'>%s</span></div><div class='node-grid'><div><span>Host ESXi</span><strong>%s</strong></div><div><span>CPU</span><strong>%s vCPU</strong></div><div><span>RAM asignada</span><strong>%s GB</strong></div><div><span>Reserva RAM</span><strong>%s MB (%s%%)</strong></div><div><span>Estado reserva</span><strong>%s</strong></div><div><span>Hardware</span><strong>%s</strong></div><div><span>Tools</span><strong>%s</strong></div></div><div class='node-footer'><span>Discos: %s</span><span>Red: %s</span></div></article>" % tuple(html.escape(str(x)) for x in [vm["name"], vm.get("vcenter", "offline"), vm["host"], vm["cpu"]["vcpus"], round(vm["memory"]["assigned_mb"] / 1024, 1), vm["memory"]["reservation_mb"], vm["memory"]["reservation_percent"], vm["memory"]["reservation_status"], vm["platform"]["virtual_hardware"], vm["platform"]["tools_status"], disks or "No informado", networks or "No informado"]))
+            recommendation = vm["cpu"]["recommendation"]
+            advice_style = "border-left:3px solid #28784b;background:#eaf7ef;padding:10px 11px;margin:12px 0" if recommendation["status"] == "ALINEADA" else "border-left:3px solid #c43d3d;background:#fff1f1;padding:10px 11px;margin:12px 0"
+            shares = vm["cpu"]["shares"]
+            shares_text = "%s (%s)" % (shares["level"], shares["shares"] if shares["shares"] is not None else "default")
+            node_cards.append("<article class='node-card'><div class='node-heading'><div><span class='eyebrow'>Nodo</span><h3>%s</h3></div><span class='site'>%s</span></div><div class='node-grid'><div><span>Host ESXi</span><strong>%s</strong></div><div><span>CPU / Shares</span><strong>%s vCPU · %s</strong></div><div><span>RAM asignada</span><strong>%s GB</strong></div><div><span>Reserva RAM</span><strong>%s MB (%s%%)</strong></div><div><span>Estado reserva</span><strong>%s</strong></div><div><span>Hardware</span><strong>%s</strong></div><div><span>Tools</span><strong>%s</strong></div></div><div class='cpu-advice %s' style='%s'><span>Recomendacion de topologia CPU</span><strong>%s</strong><small>%s</small></div><div class='os-advice'><span>OS configurado vs VMware Tools</span><strong>%s</strong><small>Configurado: %s · Tools: %s</small><p>%s</p></div><div class='node-footer'><span>Discos: %s</span><span>Red: %s</span></div></article>" % tuple(html.escape(str(x)) for x in [vm["name"], vm.get("vcenter", "offline"), vm["host"], vm["cpu"]["vcpus"], shares_text, round(vm["memory"]["assigned_mb"] / 1024, 1), vm["memory"]["reservation_mb"], vm["memory"]["reservation_percent"], vm["memory"]["reservation_status"], vm["platform"]["virtual_hardware"], vm["platform"]["tools_status"], recommendation["status"].lower(), advice_style, recommendation["message"], recommendation["host_baseline"], vm["os"]["status"], vm["os"]["configured"], vm["os"]["tools_reported"], vm["os"]["recommendation"], disks or "No informado", networks or "No informado"]))
         rows.append("<section class='cluster-section'><div class='cluster-header'><div><span class='eyebrow'>Cluster Always On</span><h2>%s</h2><p>%s nodos · %s host(s) fisico(s)</p></div><div class='score-ring %s'><strong>%s</strong><span>/100</span><small>%s</small></div></div><div class='node-cards'>%s</div><h3 class='section-title'>Matriz de hallazgos y remediacion</h3><div class='finding-list'>" % (html.escape(cluster["name"]), node_count, len(performance["physical_hosts"]), performance["status"].lower(), performance["score"], performance["status"], "".join(node_cards)))
         for finding in cluster["findings"]:
             severity = finding.get("severity", "INFO")
