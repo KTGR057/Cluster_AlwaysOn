@@ -70,6 +70,7 @@ Para cargas criticas SQL Server, el auditor aplica adicionalmente estas reglas:
 - **Identidad del OS:** se comparan el `Guest OS` configurado en la VM y el `guestFullName` reportado por VMware Tools. El reporte muestra ambos valores, estado `COINCIDE`, `DIFIERE` o `NO_CONCLUSIVO`, y recomienda sincronizar la configuración de vCenter/Tools cuando sea necesario.
 - **E/S:** se revisan Thick Eager Zeroed, controladoras PVSCSI/NVMe, separacion de buses para SO/datos/logs/TempDB y datastores compartidos.
 - **Red y tiempo:** se informa adaptador, VLAN y MTU; se recomienda MTU 9000 solo cuando la red de replicacion lo soporte extremo a extremo. La sincronizacion NTP/dominio se deja como verificacion del guest porque vSphere no expone su estado real mediante esta consulta.
+- **Alcance DRS:** cada nodo muestra su `Cluster VMware` real. La anti-afinidad VM-VM solo puede existir entre VMs del mismo `ClusterComputeResource`; si los nodos del Always On estan en clusters VMware distintos, el reporte lo informa y no genera un falso incumplimiento de una regla que no puede cruzar ese limite.
 
 ### Datos necesarios para MTU
 

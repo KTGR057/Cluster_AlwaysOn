@@ -5,6 +5,7 @@ import datetime as dt
 import html
 import json
 import os
+import re
 import ssl
 import sys
 from collections import Counter
@@ -164,6 +165,25 @@ def os_snapshot(vm, config):
     }
 
 
+def latency_sensitivity_snapshot(config):
+    latency = getattr(config, "latencySensitivity", None)
+    level = str(getattr(latency, "level", "normal") or "normal").lower()
+    return {"level": level}
+
+
+_PORTGROUP_INDEX_CACHE = {}
+
+
+def portgroup_index(content):
+    """Cache dvPortgroups per vCenter content so we don't rescan the whole inventory per NIC."""
+    key = id(content)
+    index = _PORTGROUP_INDEX_CACHE.get(key)
+    if index is None:
+        index = {getattr(pg, "key", None): pg for pg in all_objects(content, vim.dvs.DistributedVirtualPortgroup)}
+        _PORTGROUP_INDEX_CACHE[key] = index
+    return index
+
+
 def resolve_network(content, backing):
     network = prop(backing, "network", None)
     if network is not None or content is None:
@@ -171,10 +191,7 @@ def resolve_network(content, backing):
     portgroup_key = prop(backing, "port.portgroupKey", None)
     if not portgroup_key:
         return None
-    for portgroup in all_objects(content, vim.dvs.DistributedVirtualPortgroup):
-        if getattr(portgroup, "key", None) == portgroup_key:
-            return portgroup
-    return None
+    return portgroup_index(content).get(portgroup_key)
 
 
 def vm_snapshot(vm, content=None):
@@ -217,11 +234,16 @@ def vm_snapshot(vm, content=None):
     assigned_memory = config.hardware.memoryMB
     reserved_memory = allocation_value(config.memoryAllocation, "reservation", 0)
     reservation_delta = max(assigned_memory - reserved_memory, 0)
+    snapshot_info = getattr(vm, "snapshot", None)
+    has_snapshots = bool(getattr(snapshot_info, "rootSnapshotList", None))
     return {
         "name": vm.name,
         "moid": vm._moId,
         "power_state": str(vm.runtime.powerState),
         "host": prop(vm, "runtime.host.name", "Unknown"),
+        "vsphere_cluster": prop(vm, "runtime.host.parent.name", "Unknown"),
+        "has_snapshots": has_snapshots,
+        "latency_sensitivity": latency_sensitivity_snapshot(config),
         "cpu": {
             "vcpus": config.hardware.numCPU,
             "sockets": config.hardware.numCoresPerSocket and config.hardware.numCPU // config.hardware.numCoresPerSocket,
@@ -270,10 +292,37 @@ def all_objects(content, vim_type):
         view.Destroy()
 
 
+_VM_INDEX_CACHE = {}
+_CLUSTER_INDEX_CACHE = {}
+
+
+def vm_index(content):
+    """Cache VMs per vCenter content so each node lookup doesn't rescan the whole inventory."""
+    key = id(content)
+    index = _VM_INDEX_CACHE.get(key)
+    if index is None:
+        exact = {}
+        by_fold = {}
+        for vm in all_objects(content, vim.VirtualMachine):
+            exact.setdefault(vm.name, []).append(vm)
+            by_fold.setdefault(vm.name.casefold(), []).append(vm)
+        index = (exact, by_fold)
+        _VM_INDEX_CACHE[key] = index
+    return index
+
+
+def cluster_index(content):
+    key = id(content)
+    index = _CLUSTER_INDEX_CACHE.get(key)
+    if index is None:
+        index = all_objects(content, vim.ClusterComputeResource)
+        _CLUSTER_INDEX_CACHE[key] = index
+    return index
+
+
 def find_vm(content, name):
-    matches = [vm for vm in all_objects(content, vim.VirtualMachine) if vm.name == name]
-    if not matches:
-        matches = [vm for vm in all_objects(content, vim.VirtualMachine) if vm.name.casefold() == name.casefold()]
+    exact, by_fold = vm_index(content)
+    matches = exact.get(name) or by_fold.get(name.casefold(), [])
     if not matches:
         raise RuntimeError("VM no encontrada: %s" % name)
     if len(matches) > 1:
@@ -284,6 +333,11 @@ def find_vm(content, name):
 def drs_findings(content, node_names):
     node_set = set(node_names)
     findings = []
+    vm_objects = {name: find_vm(content, name) for name in node_set}
+    nodes_by_cluster = {}
+    for name, vm in vm_objects.items():
+        cluster_name = prop(vm, "runtime.host.parent.name", "Unknown")
+        nodes_by_cluster.setdefault(cluster_name, set()).add(name)
     if len(node_set) < 2:
         return [{
             "severity": "INFO",
@@ -292,12 +346,23 @@ def drs_findings(content, node_names):
             "nodes": sorted(node_set),
             "remediation": "Validar la anti-afinidad en el diseño entre sitios y mantener una regla DRS para los nodos que compartan vCenter.",
         }]
-    clusters = all_objects(content, vim.ClusterComputeResource)
+    if len(nodes_by_cluster) > 1:
+        findings.append({
+            "severity": "INFO",
+            "parameter": "drs.scope",
+            "message": "Los nodos del Always On estan distribuidos en distintos clusters VMware; las reglas DRS VM-VM solo aplican dentro del mismo cluster vSphere.",
+            "nodes_by_vsphere_cluster": {cluster: sorted(nodes) for cluster, nodes in nodes_by_cluster.items()},
+            "remediation": "Mantener reglas DRS separadas por cluster vSphere y validar la anti-afinidad entre sedes mediante la arquitectura de disponibilidad.",
+        })
+    clusters = cluster_index(content)
     for cluster in clusters:
+        cluster_nodes = nodes_by_cluster.get(cluster.name, set())
+        if len(cluster_nodes) < 2:
+            continue
         rules = prop(cluster, "configurationEx.rule", []) or []
         for rule in rules:
             members = [prop(vm, "name") for vm in (getattr(rule, "vm", None) or [])]
-            overlap = sorted(node_set.intersection(members))
+            overlap = sorted(cluster_nodes.intersection(members))
             if len(overlap) >= 2:
                 enabled = getattr(rule, "enabled", True)
                 mandatory = getattr(rule, "mandatory", False)
@@ -312,8 +377,9 @@ def drs_findings(content, node_names):
                     "nodes": overlap,
                     "mandatory": mandatory,
                 })
-    if not any(item.get("nodes") == sorted(node_set) for item in findings):
-        findings.append({"severity": "HIGH", "parameter": "drs.anti_affinity", "message": "No se encontro una regla DRS de anti-afinidad para todos los nodos del cluster", "nodes": sorted(node_set), "remediation": "Crear regla DRS VM-VM Separate Virtual Machines con todos los nodos del grupo."})
+    for cluster_name, cluster_nodes in nodes_by_cluster.items():
+        if len(cluster_nodes) >= 2 and not any(set(item.get("nodes", [])) == cluster_nodes for item in findings):
+            findings.append({"severity": "HIGH", "parameter": "drs.anti_affinity", "message": "No se encontro una regla DRS de anti-afinidad para los nodos que comparten el cluster VMware", "cluster": cluster_name, "nodes": sorted(cluster_nodes), "remediation": "Crear regla DRS VM-VM Separate Virtual Machines con los nodos de ese cluster vSphere."})
     return findings
 
 
@@ -334,6 +400,10 @@ def add_finding(findings, severity, message, parameter, actual=None, expected=No
         "os.identity": "Confirmar el OS dentro del guest, actualizar VMware Tools y corregir el Guest OS configurado en vCenter si corresponde.",
         "drs.anti_affinity": "Crear regla DRS VM-VM Separate Virtual Machines con todos los nodos del grupo.",
         "storage.datastore_affinity": "Ubicar los nodos en datastores/failure domains fisicos distintos o documentar la excepcion.",
+        "storage.disk_datastore_split": "Distribuir los VMDK de datos, logs y tempDB en datastores/LUNs distintos segun el patron de I/O de cada uno.",
+        "network.dedicated_cluster_network": "Agregar un adaptador de red dedicado (VLAN separada) para trafico de cluster/heartbeat y replica de Always On, distinto del trafico de aplicacion/cliente.",
+        "platform.snapshots": "Eliminar snapshots activos y usar backups nativos de SQL Server (Full/Log) o una solucion VSS certificada en lugar de snapshots de VM para nodos de produccion.",
+        "platform.latency_sensitivity": "Evaluar Latency Sensitivity = High solo si CPU y memoria ya estan reservadas al 100% y la carga es critica en latencia; requiere validacion de NIC/vmxnet3 y capacidad del host.",
     }
     findings.append({"severity": severity, "parameter": parameter, "message": message, "actual": actual, "expected": expected, "remediation": remediations.get(parameter, "Revisar la recomendacion y aplicar el cambio mediante Change Management.")})
 
@@ -380,6 +450,19 @@ def compare_cluster(cluster, vms, drs):
                 add_finding(findings, "MEDIUM", "Adaptador de red distinto de VMXNET3", "network.adapter", {vm["name"]: network["adapter"]}, "Vmxnet3")
             if network["mtu"] in ("Unknown", "No expuesto por API"):
                 add_finding(findings, "MEDIUM", "El MTU no esta expuesto en el objeto de red consultado", "network.mtu", {vm["name"]: network["mtu"]}, "9000 para replicacion si la red lo soporta")
+        if len(vm["networks"]) < 2:
+            add_finding(findings, "MEDIUM", "El nodo tiene un unico adaptador de red; el trafico de cluster/AG comparte la misma red que el trafico de cliente", "network.dedicated_cluster_network", {vm["name"]: len(vm["networks"])}, "al menos 2 adaptadores, uno dedicado a heartbeat/replica AG")
+        else:
+            vlans = {network["vlan"] for network in vm["networks"]}
+            if len(vlans) == 1:
+                add_finding(findings, "MEDIUM", "Todos los adaptadores de red del nodo estan en la misma VLAN; no hay evidencia de una red dedicada para trafico de cluster/AG", "network.dedicated_cluster_network", {vm["name"]: sorted(str(v) for v in vlans)}, "VLANs distintas para trafico de cliente y trafico de cluster/AG")
+        vm_datastores = {disk["datastore"] for disk in vm["disks"]}
+        if len(vm["disks"]) > 1 and len(vm_datastores) == 1:
+            add_finding(findings, "MEDIUM", "Todos los discos del nodo estan en el mismo datastore", "storage.disk_datastore_split", {vm["name"]: sorted(vm_datastores)}, "separar OS, datos, logs y tempDB en datastores distintos cuando el diseno de almacenamiento lo permita")
+    if any(vm["has_snapshots"] for vm in vms):
+        add_finding(findings, "HIGH", "Uno o mas nodos tienen snapshots activos", "platform.snapshots", {vm["name"]: vm["has_snapshots"] for vm in vms}, "sin snapshots activos en nodos de produccion")
+    if any(vm["latency_sensitivity"]["level"] != "high" for vm in vms):
+        add_finding(findings, "INFO", "Latency Sensitivity no esta en 'High' en uno o mas nodos", "platform.latency_sensitivity", {vm["name"]: vm["latency_sensitivity"]["level"] for vm in vms}, "evaluar 'High' si la carga es critica en latencia y CPU/memoria ya estan reservadas al 100%")
     datastore_sets = {vm["name"]: sorted({disk["datastore"] for disk in vm["disks"]}) for vm in vms}
     if len({tuple(value) for value in datastore_sets.values()}) == 1 and len(vms) > 1:
         add_finding(findings, "HIGH", "Los nodos comparten la misma ubicacion de datastore", "storage.datastore_affinity", datastore_sets, "datastores/failure domains distintos")
@@ -411,6 +494,9 @@ def mock_vm(name, index):
         "moid": "offline-%s" % index,
         "power_state": "poweredOn",
         "host": "esxi-offline-%d" % (index % 2 + 1),
+        "vsphere_cluster": "Cluster-OFFLINE-%d" % (index % 2 + 1),
+        "has_snapshots": False,
+        "latency_sensitivity": {"level": "normal"},
         "cpu": {"vcpus": 8 if index == 1 else 4, "sockets": 1, "cores_per_socket": 4, "reservation_mhz": 0, "limit_mhz": -1, "hot_add": False, "shares": {"level": "normal", "shares": 4000}},
         "memory": {"assigned_mb": 32768, "reservation_mb": 16384 if index == 1 else 32768, "reservation_percent": 50 if index == 1 else 100, "reservation_delta_mb": 16384 if index == 1 else 0, "reservation_status": "PARTIAL" if index == 1 else "100% LOCKED", "limit_mb": -1, "hot_add": False},
         "disks": [{"label": "Hard disk 1", "capacity_gb": 100, "controller_key": 1000, "controller": "SCSI controller 0", "provisioning": "Thin", "datastore": "DS-OFFLINE", "storage_policy": "Unspecified"}],
@@ -454,13 +540,18 @@ def offline_report(config):
     results = []
     for cluster in config["clusters"]:
         vms = [mock_vm(node["name"], index) for index, node in enumerate(cluster["nodes"], 1)]
-        drs = [{"severity": "HIGH", "message": "Modo offline: no se valido la regla DRS contra vCenter", "nodes": [node["name"] for node in cluster["nodes"]]}]
+        drs = [{"severity": "HIGH", "parameter": "drs.anti_affinity", "message": "Modo offline: no se valido la regla DRS contra vCenter", "nodes": [node["name"] for node in cluster["nodes"]]}]
         results.append(compare_cluster(cluster, vms, drs))
     return {"generated_at": dt.datetime.now(dt.timezone.utc).isoformat(), "vcenter": None, "mode": "offline", "clusters": results}
 
 
+def slugify(value):
+    return re.sub(r"[^a-z0-9]+", "-", str(value).lower()).strip("-") or "cluster"
+
+
 def html_report(report):
     rows = []
+    overview_rows = []
     cluster_count = len(report["clusters"])
     finding_count = sum(len(cluster["findings"]) for cluster in report["clusters"])
     critical_count = sum(sum(item.get("severity") == "HIGH" for item in cluster["findings"]) for cluster in report["clusters"])
@@ -468,54 +559,85 @@ def html_report(report):
     scores = [cluster["performance"]["score"] for cluster in report["clusters"]]
     global_score = round(sum(scores) / len(scores)) if scores else 0
     global_status = "RED" if critical_count else ("YELLOW" if warning_count else "GREEN")
+    used_slugs = {}
     for cluster in report["clusters"]:
         performance = cluster["performance"]
         node_count = len(cluster["nodes"])
-        node_cards = []
+        base_slug = slugify(cluster["name"])
+        used_slugs[base_slug] = used_slugs.get(base_slug, 0) + 1
+        slug = base_slug if used_slugs[base_slug] == 1 else "%s-%s" % (base_slug, used_slugs[base_slug])
+        cluster_critical = sum(item.get("severity") == "HIGH" for item in cluster["findings"])
+        cluster_warning = sum(item.get("severity") == "MEDIUM" for item in cluster["findings"])
+        overview_rows.append(
+            "<tr><td><a href='#%s'>%s</a></td><td class='num'>%s</td><td class='num'>%s</td><td class='num'>%s</td><td><span class='pill %s'>%s</span></td><td class='num'>%s</td><td class='num'>%s</td></tr>"
+            % (slug, html.escape(cluster["name"]), node_count, len(performance["physical_hosts"]), performance["score"],
+               performance["status"].lower(), performance["status"], cluster_critical, cluster_warning)
+        )
+        node_table_rows = []
+        storage_table_rows = []
         for vm in cluster["nodes"]:
             recommendation = vm["cpu"]["recommendation"]
-            advice_style = "border-left:3px solid #28784b;background:#eaf7ef;padding:10px 11px;margin:12px 0" if recommendation["status"] == "ALINEADA" else "border-left:3px solid #c43d3d;background:#fff1f1;padding:10px 11px;margin:12px 0"
             shares = vm["cpu"]["shares"]
             shares_text = "%s (%s)" % (shares["level"], shares["shares"] if shares["shares"] is not None else "default")
             controller_summary = ", ".join("%s x%s" % item for item in Counter(c["type"] for c in vm["controllers"]).items()) or "No informado"
             disk_summary = ", ".join("%s: %s" % item for item in Counter(d["provisioning"] for d in vm["disks"]).items()) or "No informado"
+            datastore_summary = ", ".join(sorted({disk["datastore"] for disk in vm["disks"]})) or "No informado"
             network_summary = ", ".join("%s / %s: %s" % (n["adapter"], n["network"], n["mtu"]) for n in vm["networks"]) or "No informado"
-            recommendations = [
-                ("Host ESXi", "Mantener los nodos en hosts fisicos distintos mediante DRS anti-afinidad."),
-                ("CPU / Shares", "Homologar vCPU, sockets, cores por socket y Shares; usar Normal salvo politica formal."),
-                ("RAM asignada", "Mantener la misma RAM entre nodos del cluster."),
-                ("Reserva RAM", "Reserve all guest memory (All locked) al 100%% y Memory Limit Unlimited."),
-                ("Estado reserva", "Corregir cualquier estado distinto de 100%% LOCKED."),
-                ("Hardware", "Homologar la VM Hardware Version entre nodos."),
-                ("VMware Tools", "Mantener la misma version compatible y el estado toolsOk/toolsCurrent."),
-                ("Topologia CPU", recommendation["message"]),
-                ("OS configurado vs VMware Tools", vm["os"]["recommendation"]),
-            ]
-            current = [
-                ("Host ESXi", vm["host"]),
-                ("CPU / Shares", "%s vCPU · %s" % (vm["cpu"]["vcpus"], shares_text)),
-                ("RAM asignada", "%s GB" % round(vm["memory"]["assigned_mb"] / 1024, 1)),
-                ("Reserva RAM", "%s MB (%s%%)" % (vm["memory"]["reservation_mb"], vm["memory"]["reservation_percent"])),
-                ("Estado reserva", vm["memory"]["reservation_status"]),
-                ("Hardware", vm["platform"]["virtual_hardware"]),
-                ("Tools", vm["platform"]["tools_version"]),
-                ("Topologia CPU", recommendation["current"]),
-                ("OS configurado vs VMware Tools", "%s / %s (%s)" % (vm["os"]["configured"], vm["os"]["tools_reported"], vm["os"]["status"])),
-            ]
-            current_html = "".join("<div style='border-top:1px solid #dbe3e8;padding:9px 0'><b style='display:block;font-size:11px;color:#687582'>%s</b><span style='display:block;font-weight:400;margin-top:2px'>%s</span></div>" % (html.escape(title), html.escape(value)) for title, value in current)
-            recommendation_html = "".join("<div style='border-top:1px solid #dbe3e8;padding:9px 0'><b style='display:block;font-size:11px;color:#687582'>%s</b><span style='display:block;font-weight:400;margin-top:2px'>%s</span></div>" % (html.escape(title), html.escape(value)) for title, value in recommendations)
-            node_cards.append("<article class='node-card'><div class='node-heading'><div><span class='eyebrow'>Nodo</span><h3>%s</h3></div><span class='site'>%s</span></div><div class='node-summary' style='display:grid;grid-template-columns:repeat(2,minmax(0,1fr));column-gap:20px;margin-top:10px'>%s</div></article>" % (html.escape(vm["name"]), html.escape(vm.get("vcenter", "offline")), current_html))
-            node_cards.append("<article class='node-card recommendations-card'><div class='section-title'><strong>Recomendaciones</strong><span>Acciones sugeridas por parametro</span></div><div class='recommendation-list' style='margin-top:8px'>%s</div></article>" % recommendation_html)
-            node_cards.append("<article class='node-card storage-card'><div class='section-title'><strong>Aprovisionamiento y red</strong><span>Resumen consolidado</span></div><div class='storage-summary' style='display:grid;gap:12px;margin-top:12px'><div><b style='display:block;font-size:11px;color:#687582'>Controladoras</b><span style='font-weight:400'>%s</span></div><div><b style='display:block;font-size:11px;color:#687582'>Discos por tipo</b><span style='font-weight:400'>%s</span></div><div><b style='display:block;font-size:11px;color:#687582'>Red por adaptador / VLAN / MTU</b><span style='font-weight:400'>%s</span></div></div></article>" % (html.escape(controller_summary), html.escape(disk_summary), html.escape(network_summary)))
-        rows.append("<section class='cluster-section'><div class='cluster-header'><div><span class='eyebrow'>Cluster Always On</span><h2>%s</h2><p>%s nodos · %s host(s) fisico(s)</p></div><div class='score-ring %s'><strong>%s</strong><span>/100</span><small>%s</small></div></div><div class='node-cards'>%s</div><h3 class='section-title'>Matriz de hallazgos y remediacion</h3><div class='finding-list'>" % (html.escape(cluster["name"]), node_count, len(performance["physical_hosts"]), performance["status"].lower(), performance["score"], performance["status"], "".join(node_cards)))
+            topology_pill = "ok" if recommendation["status"] == "ALINEADA" else "bad"
+            os_pill = "ok" if vm["os"]["status"] == "COINCIDE" else "bad"
+            reservation_pill = "ok" if vm["memory"]["reservation_delta_mb"] == 0 else "bad"
+            latency_level = vm["latency_sensitivity"]["level"]
+            latency_pill = "ok" if latency_level == "high" else "info"
+            snapshot_badge = " <span class='pill bad'>Snapshot activo</span>" if vm["has_snapshots"] else ""
+            node_table_rows.append(
+                "<tr><td><strong>%s</strong><br><span class='muted'>%s</span></td><td>%s<br><span class='muted'>%s</span></td>"
+                "<td>%s vCPU<br><span class='muted'>%s</span> · <span class='pill %s' title='%s'>%s</span></td>"
+                "<td>%s GB<br><span class='pill %s'>%s</span> (%s%%)</td>"
+                "<td>%s<br><span class='muted'>%s</span><br><span class='pill %s'>Latency: %s</span>%s</td><td><span class='pill %s'>%s</span></td></tr>"
+                % (html.escape(vm["name"]), html.escape(vm.get("vcenter", "offline")),
+                   html.escape(vm["host"]), html.escape(vm["vsphere_cluster"]),
+                   vm["cpu"]["vcpus"], html.escape(shares_text), topology_pill, html.escape(recommendation["message"]), recommendation["status"],
+                   round(vm["memory"]["assigned_mb"] / 1024, 1), reservation_pill, vm["memory"]["reservation_status"], vm["memory"]["reservation_percent"],
+                   html.escape(vm["platform"]["virtual_hardware"]), html.escape(vm["platform"]["tools_version"]),
+                   latency_pill, html.escape(latency_level), snapshot_badge,
+                   os_pill, vm["os"]["status"])
+            )
+            storage_table_rows.append(
+                "<tr><td><strong>%s</strong></td><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>"
+                % (html.escape(vm["name"]), html.escape(controller_summary), html.escape(disk_summary), html.escape(datastore_summary), html.escape(network_summary))
+            )
+        finding_rows = []
         for finding in cluster["findings"]:
             severity = finding.get("severity", "INFO")
-            rows.append("<article class='finding %s'><div class='finding-top'><span class='severity'>%s</span><span class='parameter'>%s</span></div><h4>%s</h4><div class='finding-values'><div><span>Actual</span><strong>%s</strong></div><div><span>Esperado</span><strong>%s</strong></div></div><p><b>Remediacion:</b> %s</p></article>" % tuple(html.escape(str(x)) for x in [severity.lower(), severity, finding.get("parameter", ""), finding.get("message", ""), finding.get("actual", ""), finding.get("expected", ""), finding.get("remediation", "Revisar manualmente")]))
-        rows.append("</div></section>")
+            cells = [finding.get("parameter", ""), finding.get("message", ""), finding.get("actual", ""), finding.get("expected", ""), finding.get("remediation", "Revisar manualmente")]
+            escaped = [html.escape(str(x)) for x in cells]
+            finding_rows.append(
+                "<tr class='%s'><td><span class='pill %s'>%s</span></td><td class='mono'>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>"
+                % (severity.lower(), severity.lower(), severity, escaped[0], escaped[1], escaped[2], escaped[3], escaped[4])
+            )
+        findings_html = (
+            "<table class='data-table finding-table'><thead><tr><th>Severidad</th><th>Parametro</th><th>Hallazgo</th><th>Actual</th><th>Esperado</th><th>Remediacion</th></tr></thead><tbody>%s</tbody></table>"
+            % "".join(finding_rows)
+            if finding_rows else "<p class='muted'>Sin hallazgos para este cluster.</p>"
+        )
+        open_attr = " open" if performance["status"] == "RED" else ""
+        rows.append(
+            "<details class='cluster-section' id='%s'%s><summary class='cluster-header'><div><span class='chevron'>&#9656;</span><span class='eyebrow'>Cluster Always On</span><h2>%s</h2><p>%s nodos · %s host(s) fisico(s)</p></div><div class='score-ring %s'><strong>%s</strong><span>/100</span><small>%s</small></div></summary><div class='cluster-body'>"
+            "<h3 class='section-title'>Nodos</h3><div class='table-scroll'><table class='data-table node-table'><thead><tr><th>Nodo</th><th>Host ESXi</th><th>CPU</th><th>RAM</th><th>Plataforma</th><th>OS</th></tr></thead><tbody>%s</tbody></table></div>"
+            "<h3 class='section-title'>Aprovisionamiento y red</h3><div class='table-scroll'><table class='data-table storage-table'><thead><tr><th>Nodo</th><th>Controladoras</th><th>Discos</th><th>Datastores</th><th>Red (adaptador / VLAN / MTU)</th></tr></thead><tbody>%s</tbody></table></div>"
+            "<h3 class='section-title'>Hallazgos y remediacion</h3>%s</div></details>"
+            % (slug, open_attr, html.escape(cluster["name"]), node_count, len(performance["physical_hosts"]),
+               performance["status"].lower(), performance["score"], performance["status"],
+               "".join(node_table_rows), "".join(storage_table_rows), findings_html)
+        )
+    overview_html = (
+        "<section class='overview'><h2 class='section-title'>Resumen por cluster</h2><div class='table-scroll'><table class='data-table overview-table'><thead><tr><th>Cluster</th><th>Nodos</th><th>Hosts</th><th>Score</th><th>Estado</th><th>Criticos</th><th>Advertencias</th></tr></thead><tbody>%s</tbody></table></div></section>"
+        % "".join(overview_rows)
+    )
     generated = html.escape(report["generated_at"])
     return ("""<!doctype html><html lang='es'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>Auditoria Always On</title><style>
-:root{--ink:#17212b;--muted:#687582;--line:#dbe3e8;--paper:#f4f7f8;--white:#fff;--navy:#12344d;--red:#c43d3d;--red-bg:#fff1f1;--amber:#a66b00;--amber-bg:#fff8e6;--green:#28784b;--green-bg:#eaf7ef;--shadow:0 12px 28px rgba(18,52,77,.08)}*{box-sizing:border-box}body{margin:0;background:var(--paper);color:var(--ink);font:14px/1.5 Inter,Segoe UI,Arial,sans-serif}main{max-width:1440px;margin:0 auto;padding:34px 28px 60px}.hero{background:var(--navy);color:#fff;border-radius:14px;padding:32px 36px;box-shadow:var(--shadow);display:flex;justify-content:space-between;gap:28px;align-items:flex-end}.eyebrow{text-transform:uppercase;letter-spacing:.12em;font-size:11px;font-weight:700;color:#7892a4}.hero .eyebrow{color:#9db7c8}.hero h1{font-size:32px;line-height:1.1;margin:7px 0 10px;font-weight:700}.hero p{margin:0;color:#c7d7e1}.hero-meta{text-align:right;color:#c7d7e1}.hero-meta strong{display:block;color:#fff;font-size:16px}.summary{display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin:22px 0}.metric{background:var(--white);border:1px solid var(--line);border-radius:10px;padding:18px 20px;box-shadow:var(--shadow)}.metric span{display:block;color:var(--muted);font-size:12px;text-transform:uppercase;letter-spacing:.06em}.metric strong{display:block;font-size:29px;margin-top:5px;color:var(--navy)}.metric.red strong{color:var(--red)}.metric.yellow strong{color:var(--amber)}.metric.green strong{color:var(--green)}.cluster-section{background:var(--white);border:1px solid var(--line);border-radius:12px;padding:24px;margin:20px 0;box-shadow:var(--shadow)}.cluster-header{display:flex;justify-content:space-between;align-items:center;gap:20px;border-bottom:1px solid var(--line);padding-bottom:18px}.cluster-header h2{margin:4px 0;font-size:24px;color:var(--navy)}.cluster-header p{margin:0;color:var(--muted)}.score-ring{width:92px;height:92px;border:7px solid var(--line);border-radius:50%;display:flex;flex-wrap:wrap;align-content:center;justify-content:center;line-height:1}.score-ring strong{font-size:25px}.score-ring span{font-size:11px;color:var(--muted);align-self:center;margin-left:2px}.score-ring small{width:100%;text-align:center;font-size:10px;font-weight:700;letter-spacing:.1em;margin-top:5px}.score-ring.red{border-color:#edb1b1;color:var(--red)}.score-ring.yellow{border-color:#efd58e;color:var(--amber)}.score-ring.green{border-color:#a8d9ba;color:var(--green)}.node-cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:14px;padding:20px 0}.node-card{border:1px solid var(--line);border-radius:9px;padding:17px;background:#fbfcfd}.node-heading{display:flex;justify-content:space-between;align-items:flex-start;border-bottom:1px solid var(--line);padding-bottom:12px}.node-heading h3{margin:3px 0 0;font-size:18px;color:var(--navy)}.site{font-size:11px;background:#e7f0f5;color:var(--navy);border-radius:4px;padding:4px 7px;font-weight:700}.node-grid{display:grid;grid-template-columns:1fr 1fr;gap:13px;margin:16px 0}.node-grid span,.finding-values span{display:block;color:var(--muted);font-size:11px}.node-grid strong{display:block;font-size:14px;margin-top:2px}.node-footer{border-top:1px solid var(--line);padding-top:11px;color:var(--muted);font-size:12px;display:grid;gap:4px}.section-title{font-size:17px;color:var(--navy);margin:6px 0 13px}.finding-list{display:grid;gap:10px}.finding{border:1px solid var(--line);border-left:4px solid var(--line);border-radius:7px;padding:13px 15px;background:#fff}.finding.high{border-left-color:var(--red);background:var(--red-bg)}.finding.medium{border-left-color:#d9a52d;background:var(--amber-bg)}.finding.info{border-left-color:var(--green);background:var(--green-bg)}.finding-top{display:flex;justify-content:space-between;gap:12px;align-items:center}.severity{font-size:10px;font-weight:800;letter-spacing:.1em}.parameter{font:11px Consolas,monospace;color:var(--muted)}.finding h4{margin:7px 0;font-size:14px}.finding-values{display:grid;grid-template-columns:1fr 1fr;gap:15px;margin:10px 0}.finding-values strong{display:block;word-break:break-word;font-size:12px}.finding p{margin:8px 0 0;color:#485762;font-size:12px}.footer{color:var(--muted);font-size:12px;text-align:right;margin-top:18px}@media(max-width:760px){main{padding:16px 12px 40px}.hero{display:block;padding:24px}.hero h1{font-size:26px}.hero-meta{text-align:left;margin-top:18px}.summary{grid-template-columns:1fr 1fr}.cluster-section{padding:17px}.cluster-header{align-items:flex-start}.score-ring{flex:0 0 82px;width:82px;height:82px}.finding-values{grid-template-columns:1fr}.node-cards{grid-template-columns:1fr}}@media(max-width:420px){.summary{grid-template-columns:1fr}.cluster-header h2{font-size:20px}}
-</style></head><body><main><header class='hero'><div><span class='eyebrow'>Informe de infraestructura critica</span><h1>Auditoria SQL Server Always On</h1><p>Evaluacion de homologacion, disponibilidad y rendimiento en VMware vSphere.</p></div><div class='hero-meta'><span>Generado</span><strong>%s</strong><span>Modo: %s</span></div></header><section class='summary'><div class='metric %s'><span>Score global</span><strong>%s/100</strong></div><div class='metric'><span>Clusters auditados</span><strong>%s</strong></div><div class='metric red'><span>Riesgos criticos</span><strong>%s</strong></div><div class='metric yellow'><span>Advertencias</span><strong>%s</strong></div></section>%s<footer class='footer'>Fuente: vCenter y configuracion declarada del inventario Always On.</footer></main></body></html>""".replace("%", "%%").replace("%%s", "%s") % (generated, html.escape(report.get("mode", "vCenter")), global_status.lower(), global_score, cluster_count, critical_count, warning_count, "".join(rows)))
+:root{--ink:#17212b;--muted:#687582;--line:#dbe3e8;--paper:#f4f7f8;--white:#fff;--navy:#12344d;--red:#c43d3d;--red-bg:#fff1f1;--amber:#a66b00;--amber-bg:#fff8e6;--green:#28784b;--green-bg:#eaf7ef;--shadow:0 12px 28px rgba(18,52,77,.08)}*{box-sizing:border-box}body{margin:0;background:var(--paper);color:var(--ink);font:14px/1.5 Inter,Segoe UI,Arial,sans-serif}main{max-width:1440px;margin:0 auto;padding:34px 28px 60px}.hero{background:var(--navy);color:#fff;border-radius:14px;padding:32px 36px;box-shadow:var(--shadow);display:flex;justify-content:space-between;gap:28px;align-items:flex-end}.eyebrow{text-transform:uppercase;letter-spacing:.12em;font-size:11px;font-weight:700;color:#7892a4}.hero .eyebrow{color:#9db7c8}.hero h1{font-size:32px;line-height:1.1;margin:7px 0 10px;font-weight:700}.hero p{margin:0;color:#c7d7e1}.hero-meta{text-align:right;color:#c7d7e1}.hero-meta strong{display:block;color:#fff;font-size:16px}.summary{display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin:22px 0}.metric{background:var(--white);border:1px solid var(--line);border-radius:10px;padding:18px 20px;box-shadow:var(--shadow)}.metric span{display:block;color:var(--muted);font-size:12px;text-transform:uppercase;letter-spacing:.06em}.metric strong{display:block;font-size:29px;margin-top:5px;color:var(--navy)}.metric.red strong{color:var(--red)}.metric.yellow strong{color:var(--amber)}.metric.green strong{color:var(--green)}.overview{background:var(--white);border:1px solid var(--line);border-radius:12px;padding:20px 22px;margin:20px 0;box-shadow:var(--shadow)}.section-title{font-size:17px;color:var(--navy);margin:6px 0 13px}.table-scroll{overflow-x:auto}.data-table{width:100%;border-collapse:collapse;font-size:13px}.data-table th,.data-table td{padding:8px 10px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top}.data-table thead th{background:#eef2f4;color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.05em;white-space:nowrap}.data-table td.num,.data-table th.num{text-align:right;font-variant-numeric:tabular-nums}.overview-table td:nth-child(2),.overview-table td:nth-child(3),.overview-table td:nth-child(4),.overview-table td:nth-child(6),.overview-table td:nth-child(7),.overview-table th:nth-child(2),.overview-table th:nth-child(3),.overview-table th:nth-child(4),.overview-table th:nth-child(6),.overview-table th:nth-child(7){text-align:right;font-variant-numeric:tabular-nums}.overview-table a{color:var(--navy);font-weight:700;text-decoration:none}.overview-table a:hover{text-decoration:underline}.muted{color:var(--muted);font-size:12px}.mono{font:11px Consolas,monospace;color:var(--muted)}.pill{display:inline-block;padding:2px 9px;border-radius:999px;font-size:11px;font-weight:800;letter-spacing:.04em;white-space:nowrap}.pill.ok,.pill.green,.pill.GREEN{background:var(--green-bg);color:var(--green)}.pill.bad,.pill.red,.pill.RED,.pill.high{background:var(--red-bg);color:var(--red)}.pill.yellow,.pill.YELLOW,.pill.medium{background:var(--amber-bg);color:var(--amber)}.pill.info{background:var(--green-bg);color:var(--green)}.cluster-section{background:var(--white);border:1px solid var(--line);border-radius:12px;margin:14px 0;box-shadow:var(--shadow);overflow:hidden}.cluster-section>summary{list-style:none;cursor:pointer}.cluster-section>summary::-webkit-details-marker{display:none}.cluster-header{display:flex;justify-content:space-between;align-items:center;gap:20px;padding:18px 22px}.cluster-header h2{margin:4px 0;font-size:22px;color:var(--navy);display:inline}.cluster-header p{margin:0;color:var(--muted)}.chevron{display:inline-block;margin-right:8px;color:var(--muted);transition:transform .15s}details[open]>summary .chevron{transform:rotate(90deg)}.cluster-body{padding:2px 22px 22px;border-top:1px solid var(--line)}.cluster-body h3.section-title{margin-top:18px}.score-ring{width:78px;height:78px;border:6px solid var(--line);border-radius:50%;display:flex;flex-wrap:wrap;align-content:center;justify-content:center;line-height:1;flex:0 0 auto}.score-ring strong{font-size:21px}.score-ring span{font-size:10px;color:var(--muted);align-self:center;margin-left:2px}.score-ring small{width:100%;text-align:center;font-size:9px;font-weight:700;letter-spacing:.1em;margin-top:4px}.score-ring.red{border-color:#edb1b1;color:var(--red)}.score-ring.yellow{border-color:#efd58e;color:var(--amber)}.score-ring.green{border-color:#a8d9ba;color:var(--green)}tr.high{background:var(--red-bg)}tr.medium{background:var(--amber-bg)}tr.info{background:var(--green-bg)}.footer{color:var(--muted);font-size:12px;text-align:right;margin-top:18px}@media(max-width:760px){main{padding:16px 12px 40px}.hero{display:block;padding:24px}.hero h1{font-size:26px}.hero-meta{text-align:left;margin-top:18px}.summary{grid-template-columns:1fr 1fr}.overview{padding:16px}.cluster-header{align-items:flex-start;padding:16px}.score-ring{flex:0 0 68px;width:68px;height:68px}.data-table{font-size:12px}}@media(max-width:420px){.summary{grid-template-columns:1fr}.cluster-header h2{font-size:18px}}
+</style></head><body><main><header class='hero'><div><span class='eyebrow'>Informe de infraestructura critica</span><h1>Auditoria SQL Server Always On</h1><p>Evaluacion de homologacion, disponibilidad y rendimiento en VMware vSphere.</p></div><div class='hero-meta'><span>Generado</span><strong>%s</strong><span>Modo: %s</span></div></header><section class='summary'><div class='metric %s'><span>Score global</span><strong>%s/100</strong></div><div class='metric'><span>Clusters auditados</span><strong>%s</strong></div><div class='metric red'><span>Riesgos criticos</span><strong>%s</strong></div><div class='metric yellow'><span>Advertencias</span><strong>%s</strong></div></section>%s%s<footer class='footer'>Fuente: vCenter y configuracion declarada del inventario Always On.</footer></main></body></html>""".replace("%", "%%").replace("%%s", "%s") % (generated, html.escape(report.get("mode", "vCenter")), global_status.lower(), global_score, cluster_count, critical_count, warning_count, overview_html, "".join(rows)))
 
 
 def main():
