@@ -4,4 +4,5 @@ clusters:
     etiqueta: DG
     nodos:
       - BOPVSVWSSDGN01
-      - MEPVSVWSSDGN01
+      - MEPVSVWSSDGN01_C
+      - BOPVSVWSSDGN02

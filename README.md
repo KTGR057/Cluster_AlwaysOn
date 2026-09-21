@@ -41,7 +41,15 @@ Los nodos deben ser nombres de VM en el vCenter seleccionado. La busqueda ignora
 
 ## Salidas
 
-Jenkins archiva en `artifacts/`:
+Durante la ejecución, los archivos se crean temporalmente en `artifacts/` dentro del workspace del agente. Antes de ejecutar `cleanWs`, Jenkins hace lo siguiente:
+
+- `archiveArtifacts` guarda el JSON y el HTML como artefactos permanentes del build.
+- `publishHTML` publica el HTML en la página del job.
+- `cleanWs` elimina únicamente la copia temporal del workspace.
+
+Por tanto, el reporte se consulta desde Jenkins en el build ejecutado, en **Artifacts** o en **Auditoria SQL Server Always On**. La permanencia depende de la política de retención de builds de Jenkins y del Artifact Manager configurado.
+
+Jenkins conserva:
 
 - `alwayson-audit-*.json`: inventario detallado, hallazgos, hosts fisicos y valores comparados.
 - `alwayson-audit-*.html`: resumen navegable con CPU, memoria, discos, red y recomendaciones.
@@ -51,6 +59,17 @@ Jenkins archiva en `artifacts/`:
 El pipeline ejecuta la consulta real contra ambos vCenter. La validación de certificados TLS queda desactivada para mantener compatibilidad con el pipeline existente; la credencial `vcenter_admin` debe tener permisos de lectura en ambos.
 
 Se reportan CPU (vCPU, sockets, cores/socket, reservas y limites), memoria (asignacion, reserva porcentual y limite), discos y controladores SCSI, aprovisionamiento, datastore/politica, adaptadores y red, hosts fisicos y reglas DRS.
+
+Para cargas criticas SQL Server, el auditor aplica adicionalmente estas reglas:
+
+- **vNUMA:** vCPU, sockets y cores por socket deben ser identicos; CPU Hot-Plug debe estar deshabilitado.
+- **Memoria:** la reserva debe ser del 100% de la RAM asignada y Memory Limit debe estar en Unlimited; Memory Hot-Add debe estar deshabilitado.
+- **Hardware virtual:** la VM Hardware Version debe ser igual entre nodos.
+- **VMware Tools:** se informa version y estado de Tools por VM y se marca inconsistencia o estado no saludable. La condicion de "ultima version compatible" requiere definir una baseline corporativa; sin ella el auditor no inventa una version objetivo.
+- **E/S:** se revisan Thick Eager Zeroed, controladoras PVSCSI/NVMe, separacion de buses para SO/datos/logs/TempDB y datastores compartidos.
+- **Red y tiempo:** se informa adaptador, VLAN y MTU; se recomienda MTU 9000 solo cuando la red de replicacion lo soporte extremo a extremo. La sincronizacion NTP/dominio se deja como verificacion del guest porque vSphere no expone su estado real mediante esta consulta.
+
+El JSON conserva `score`, `status` (`RED`, `YELLOW` o `GREEN`) y cada hallazgo incluye parametro, valor actual, valor esperado y remediacion sugerida. El HTML presenta la misma informacion en una matriz visual.
 
 ## Recomendaciones evaluadas
 
@@ -70,7 +89,7 @@ Estas son comprobaciones de referencia, no sustituyen la validacion de la arquit
 
 La credencial `vcenter_admin` debe tener permisos de lectura sobre VMs, datastores, redes, clusters DRS y reglas. No se requieren permisos de escritura. La contrasena se inyecta con `withCredentials` y se consume por variables de entorno; no se escribe en archivos ni argumentos de proceso.
 
-Por compatibilidad con el repositorio de aprovisionamiento, el pipeline deja `VALIDATE_CERTS` desactivado por defecto. En produccion debe instalarse la CA de vCenter en la imagen del contenedor y ejecutarse con `VALIDATE_CERTS=true`.
+Para conservar históricos por más tiempo, la opción recomendada es configurar el Artifact Manager de Jenkins hacia S3, MinIO, Nexus o almacenamiento corporativo. Como alternativa, se puede copiar el reporte a un servidor remoto por SFTP, pero se necesitarían el host, la ruta, el puerto y una credencial SSH administrada por Jenkins. Esos datos no deben quedar escritos en el repositorio.
 
 ## Ejecucion
 
