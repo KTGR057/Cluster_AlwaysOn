@@ -7,6 +7,7 @@ import json
 import os
 import ssl
 import sys
+from collections import Counter
 from pathlib import Path
 
 import yaml
@@ -472,17 +473,40 @@ def html_report(report):
         node_count = len(cluster["nodes"])
         node_cards = []
         for vm in cluster["nodes"]:
-            disks = ", ".join(d["provisioning"] for d in vm["disks"])
-            networks = ", ".join(n["adapter"] + " / " + str(n["network"]) for n in vm["networks"])
             recommendation = vm["cpu"]["recommendation"]
             advice_style = "border-left:3px solid #28784b;background:#eaf7ef;padding:10px 11px;margin:12px 0" if recommendation["status"] == "ALINEADA" else "border-left:3px solid #c43d3d;background:#fff1f1;padding:10px 11px;margin:12px 0"
             shares = vm["cpu"]["shares"]
             shares_text = "%s (%s)" % (shares["level"], shares["shares"] if shares["shares"] is not None else "default")
-            values = [vm["name"], vm.get("vcenter", "offline"), vm["host"], vm["cpu"]["vcpus"], shares_text, recommendation["current"], round(vm["memory"]["assigned_mb"] / 1024, 1), vm["memory"]["reservation_mb"], vm["memory"]["reservation_percent"], vm["memory"]["reservation_status"], ", ".join(c["type"] for c in vm["controllers"]) or "No informado", networks or "No informado", ", ".join(str(n["mtu"]) for n in vm["networks"]) or "No informado", vm["os"]["status"], vm["os"]["configured"], vm["os"]["tools_reported"], vm["platform"]["virtual_hardware"], vm["platform"]["tools_version"], disks or "No informado", recommendation["status"].lower(), advice_style, recommendation["message"], recommendation["host_baseline"], vm["os"]["recommendation"], "Configurado: %s · VMware Tools: %s" % (vm["os"]["configured"], vm["os"]["tools_reported"])]
-            escaped = [html.escape(str(value)) for value in values]
-            node_cards.append("<article class='node-card'><div class='node-heading'><div><span class='eyebrow'>Nodo</span><h3>%s</h3></div><span class='site'>%s</span></div><div class='node-summary'><div class='summary-section'><strong>CPU</strong><div><b>Host ESXi</b><span>%s</span></div><div><b>vCPU / Shares</b><span>%s vCPU · %s</span></div><div><b>Topologia actual</b><span>%s</span></div></div><div class='summary-section'><strong>Memoria</strong><div><b>RAM asignada</b><span>%s GB</span></div><div><b>Reserva</b><span>%s MB (%s%%)</span></div><div><b>Estado</b><span>%s</span></div></div><div class='summary-section'><strong>Red</strong><div><b>Adaptador / VLAN</b><span>%s</span></div><div><b>MTU</b><span>%s</span></div></div><div class='summary-section'><strong>OS</strong><div><b>Estado</b><span>%s</span></div><div><b>Configurado</b><span>%s</span></div><div><b>VMware Tools reporta</b><span>%s</span></div></div><div class='summary-section'><strong>Plataforma</strong><div><b>Hardware virtual</b><span>%s</span></div><div><b>VMware Tools version</b><span>%s</span></div></div></div></article>" % tuple(escaped[:17]))
-            node_cards.append("<article class='node-card storage-card'><div class='section-title'><strong>Almacenamiento</strong><span>Detalle de discos y controladoras</span></div><div class='storage-summary'><div><b>Controladoras</b><span>%s</span></div><div><b>Aprovisionamiento</b><span>%s</span></div></div></article>" % (escaped[10], escaped[18]))
-            node_cards.append("<article class='node-card recommendations-card'><div class='section-title'><strong>Recomendaciones</strong><span>Acciones sugeridas para este nodo</span></div><div class='cpu-advice %s' style='%s'><b>Topologia CPU</b><span>%s</span><small>%s</small></div><div class='os-advice'><b>OS</b><span>%s</span><small>%s</small></div></article>" % tuple(escaped[19:]))
+            controller_summary = ", ".join("%s x%s" % item for item in Counter(c["type"] for c in vm["controllers"]).items()) or "No informado"
+            disk_summary = ", ".join("%s: %s" % item for item in Counter(d["provisioning"] for d in vm["disks"]).items()) or "No informado"
+            network_summary = ", ".join("%s / %s: %s" % (n["adapter"], n["network"], n["mtu"]) for n in vm["networks"]) or "No informado"
+            recommendations = [
+                ("Host ESXi", "Mantener los nodos en hosts fisicos distintos mediante DRS anti-afinidad."),
+                ("CPU / Shares", "Homologar vCPU, sockets, cores por socket y Shares; usar Normal salvo politica formal."),
+                ("RAM asignada", "Mantener la misma RAM entre nodos del cluster."),
+                ("Reserva RAM", "Reserve all guest memory (All locked) al 100%% y Memory Limit Unlimited."),
+                ("Estado reserva", "Corregir cualquier estado distinto de 100%% LOCKED."),
+                ("Hardware", "Homologar la VM Hardware Version entre nodos."),
+                ("VMware Tools", "Mantener la misma version compatible y el estado toolsOk/toolsCurrent."),
+                ("Topologia CPU", recommendation["message"]),
+                ("OS configurado vs VMware Tools", vm["os"]["recommendation"]),
+            ]
+            current = [
+                ("Host ESXi", vm["host"]),
+                ("CPU / Shares", "%s vCPU · %s" % (vm["cpu"]["vcpus"], shares_text)),
+                ("RAM asignada", "%s GB" % round(vm["memory"]["assigned_mb"] / 1024, 1)),
+                ("Reserva RAM", "%s MB (%s%%)" % (vm["memory"]["reservation_mb"], vm["memory"]["reservation_percent"])),
+                ("Estado reserva", vm["memory"]["reservation_status"]),
+                ("Hardware", vm["platform"]["virtual_hardware"]),
+                ("Tools", vm["platform"]["tools_version"]),
+                ("Topologia CPU", recommendation["current"]),
+                ("OS configurado vs VMware Tools", "%s / %s (%s)" % (vm["os"]["configured"], vm["os"]["tools_reported"], vm["os"]["status"])),
+            ]
+            current_html = "".join("<div style='border-top:1px solid #dbe3e8;padding:9px 0'><b style='display:block;font-size:11px;color:#687582'>%s</b><span style='display:block;font-weight:400;margin-top:2px'>%s</span></div>" % (html.escape(title), html.escape(value)) for title, value in current)
+            recommendation_html = "".join("<div style='border-top:1px solid #dbe3e8;padding:9px 0'><b style='display:block;font-size:11px;color:#687582'>%s</b><span style='display:block;font-weight:400;margin-top:2px'>%s</span></div>" % (html.escape(title), html.escape(value)) for title, value in recommendations)
+            node_cards.append("<article class='node-card'><div class='node-heading'><div><span class='eyebrow'>Nodo</span><h3>%s</h3></div><span class='site'>%s</span></div><div class='node-summary' style='display:grid;grid-template-columns:repeat(2,minmax(0,1fr));column-gap:20px;margin-top:10px'>%s</div></article>" % (html.escape(vm["name"]), html.escape(vm.get("vcenter", "offline")), current_html))
+            node_cards.append("<article class='node-card recommendations-card'><div class='section-title'><strong>Recomendaciones</strong><span>Acciones sugeridas por parametro</span></div><div class='recommendation-list' style='margin-top:8px'>%s</div></article>" % recommendation_html)
+            node_cards.append("<article class='node-card storage-card'><div class='section-title'><strong>Aprovisionamiento y red</strong><span>Resumen consolidado</span></div><div class='storage-summary' style='display:grid;gap:12px;margin-top:12px'><div><b style='display:block;font-size:11px;color:#687582'>Controladoras</b><span style='font-weight:400'>%s</span></div><div><b style='display:block;font-size:11px;color:#687582'>Discos por tipo</b><span style='font-weight:400'>%s</span></div><div><b style='display:block;font-size:11px;color:#687582'>Red por adaptador / VLAN / MTU</b><span style='font-weight:400'>%s</span></div></div></article>" % (html.escape(controller_summary), html.escape(disk_summary), html.escape(network_summary)))
         rows.append("<section class='cluster-section'><div class='cluster-header'><div><span class='eyebrow'>Cluster Always On</span><h2>%s</h2><p>%s nodos · %s host(s) fisico(s)</p></div><div class='score-ring %s'><strong>%s</strong><span>/100</span><small>%s</small></div></div><div class='node-cards'>%s</div><h3 class='section-title'>Matriz de hallazgos y remediacion</h3><div class='finding-list'>" % (html.escape(cluster["name"]), node_count, len(performance["physical_hosts"]), performance["status"].lower(), performance["score"], performance["status"], "".join(node_cards)))
         for finding in cluster["findings"]:
             severity = finding.get("severity", "INFO")
