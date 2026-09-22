@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Read-only vSphere audit for SQL Server Always On VM clusters."""
 import argparse
+import base64
 import datetime as dt
 import html
 import json
@@ -35,6 +36,20 @@ REPORT_TIMEZONE = ZoneInfo(os.environ.get("REPORT_TIMEZONE", "America/Bogota"))
 
 def now_local():
     return dt.datetime.now(REPORT_TIMEZONE)
+
+
+LOGO_PATH = Path(__file__).resolve().parent.parent / "assets" / "henkia_logo.png"
+
+
+def logo_data_uri():
+    """Embed the corporate logo as base64 so the HTML report stays a single portable file.
+    Returns None if the asset isn't present (report still renders, just without the logo)."""
+    try:
+        data = LOGO_PATH.read_bytes()
+    except OSError:
+        return None
+    return "data:image/png;base64,%s" % base64.b64encode(data).decode("ascii")
+
 
 # Baseline supplied for the physical hosts: 2 sockets x 32 physical cores.
 HOST_NUMA_CORES = 32
@@ -458,8 +473,11 @@ def compare_cluster(cluster, vms, drs):
         elif vm["os"]["status"] == "NO_CONCLUSIVO":
             add_finding(findings, "MEDIUM", "No fue posible comparar el OS configurado con el reportado por VMware Tools", "os.identity", {vm["name"]: {"config_file": vm["os"]["configured"], "vmware_tools": vm["os"]["tools_reported"]}}, "Ambas fuentes disponibles y coincidentes")
     for vm in vms:
-        if not vm["controllers"] or any(not ("ParaSCSI" in controller["type"] or "ParaVirtual" in controller["type"] or "NVMe" in controller["type"]) for controller in vm["controllers"]):
-            add_finding(findings, "MEDIUM", "Controladora distinta de PVSCSI/NVMe", "storage.controllers", {vm["name"]: vm["controllers"]}, "PVSCSI o NVMe")
+        non_compliant_controllers = [c for c in vm["controllers"] if not ("ParaSCSI" in c["type"] or "ParaVirtual" in c["type"] or "NVMe" in c["type"])]
+        if not vm["controllers"]:
+            add_finding(findings, "MEDIUM", "No se encontraron controladoras SCSI", "storage.controllers", {vm["name"]: "Sin controladoras"}, "PVSCSI o NVMe")
+        elif non_compliant_controllers:
+            add_finding(findings, "MEDIUM", "Controladora distinta de PVSCSI/NVMe", "storage.controllers", {vm["name"]: non_compliant_controllers}, "PVSCSI o NVMe")
         for network in vm["networks"]:
             if network["adapter"] != "Vmxnet3":
                 add_finding(findings, "MEDIUM", "Adaptador de red distinto de VMXNET3", "network.adapter", {vm["name"]: network["adapter"]}, "Vmxnet3")
@@ -559,6 +577,28 @@ def slugify(value):
     return re.sub(r"[^a-z0-9]+", "-", str(value).lower()).strip("-") or "cluster"
 
 
+def humanize_value(value):
+    """Render finding actual/expected payloads (dicts/lists from Python) as plain text/HTML,
+    without exposing braces, quotes or key=value syntax to a non-technical reader."""
+    if isinstance(value, dict):
+        if "label" in value and "type" in value:
+            return "%s (%s)" % (html.escape(str(value["label"])), html.escape(str(value["type"])))
+        if not value:
+            return "&mdash;"
+        return "<br>".join(
+            "<b>%s:</b> %s" % (html.escape(str(key)), humanize_value(item))
+            for key, item in value.items()
+        )
+    if isinstance(value, (list, tuple, set)):
+        items = list(value)
+        return ", ".join(humanize_value(item) for item in items) if items else "&mdash;"
+    if isinstance(value, bool):
+        return "Si" if value else "No"
+    if value is None or value == "":
+        return "&mdash;"
+    return html.escape(str(value))
+
+
 def html_report(report):
     rows = []
     overview_rows = []
@@ -618,11 +658,14 @@ def html_report(report):
         finding_rows = []
         for finding in cluster["findings"]:
             severity = finding.get("severity", "INFO")
-            cells = [finding.get("parameter", ""), finding.get("message", ""), finding.get("actual", ""), finding.get("expected", ""), finding.get("remediation", "Revisar manualmente")]
-            escaped = [html.escape(str(x)) for x in cells]
+            parameter = html.escape(str(finding.get("parameter", "")))
+            message = html.escape(str(finding.get("message", "")))
+            remediation = html.escape(str(finding.get("remediation", "Revisar manualmente")))
+            actual_html = humanize_value(finding.get("actual", ""))
+            expected_html = humanize_value(finding.get("expected", ""))
             finding_rows.append(
                 "<tr class='%s'><td><span class='pill %s'>%s</span></td><td class='mono'>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>"
-                % (severity.lower(), severity.lower(), severity, escaped[0], escaped[1], escaped[2], escaped[3], escaped[4])
+                % (severity.lower(), severity.lower(), severity, parameter, message, actual_html, expected_html, remediation)
             )
         findings_html = (
             "<table class='data-table finding-table'><thead><tr><th>Severidad</th><th>Parametro</th><th>Hallazgo</th><th>Actual</th><th>Esperado</th><th>Remediacion</th></tr></thead><tbody>%s</tbody></table>"
@@ -644,9 +687,12 @@ def html_report(report):
         % "".join(overview_rows)
     )
     generated = html.escape(report["generated_at"])
-    return ("""<!doctype html><html lang='es'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>Auditoria Always On</title><style>
-:root{--ink:#17212b;--muted:#687582;--line:#dbe3e8;--paper:#f4f7f8;--white:#fff;--navy:#12344d;--red:#c43d3d;--red-bg:#fff1f1;--amber:#a66b00;--amber-bg:#fff8e6;--green:#28784b;--green-bg:#eaf7ef;--shadow:0 12px 28px rgba(18,52,77,.08)}*{box-sizing:border-box}body{margin:0;background:var(--paper);color:var(--ink);font:14px/1.5 Inter,Segoe UI,Arial,sans-serif}main{max-width:1440px;margin:0 auto;padding:34px 28px 60px}.hero{background:var(--navy);color:#fff;border-radius:14px;padding:32px 36px;box-shadow:var(--shadow);display:flex;justify-content:space-between;gap:28px;align-items:flex-end}.eyebrow{text-transform:uppercase;letter-spacing:.12em;font-size:11px;font-weight:700;color:#7892a4}.hero .eyebrow{color:#9db7c8}.hero h1{font-size:32px;line-height:1.1;margin:7px 0 10px;font-weight:700}.hero p{margin:0;color:#c7d7e1}.hero-meta{text-align:right;color:#c7d7e1}.hero-meta strong{display:block;color:#fff;font-size:16px}.summary{display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin:22px 0}.metric{background:var(--white);border:1px solid var(--line);border-radius:10px;padding:18px 20px;box-shadow:var(--shadow)}.metric span{display:block;color:var(--muted);font-size:12px;text-transform:uppercase;letter-spacing:.06em}.metric strong{display:block;font-size:29px;margin-top:5px;color:var(--navy)}.metric.red strong{color:var(--red)}.metric.yellow strong{color:var(--amber)}.metric.green strong{color:var(--green)}.overview{background:var(--white);border:1px solid var(--line);border-radius:12px;padding:20px 22px;margin:20px 0;box-shadow:var(--shadow)}.section-title{font-size:17px;color:var(--navy);margin:6px 0 13px}.table-scroll{overflow-x:auto}.data-table{width:100%;border-collapse:collapse;font-size:13px}.data-table th,.data-table td{padding:8px 10px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top}.data-table thead th{background:#eef2f4;color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.05em;white-space:nowrap}.data-table td.num,.data-table th.num{text-align:right;font-variant-numeric:tabular-nums}.overview-table td:nth-child(2),.overview-table td:nth-child(3),.overview-table td:nth-child(4),.overview-table td:nth-child(6),.overview-table td:nth-child(7),.overview-table th:nth-child(2),.overview-table th:nth-child(3),.overview-table th:nth-child(4),.overview-table th:nth-child(6),.overview-table th:nth-child(7){text-align:right;font-variant-numeric:tabular-nums}.overview-table a{color:var(--navy);font-weight:700;text-decoration:none}.overview-table a:hover{text-decoration:underline}.muted{color:var(--muted);font-size:12px}.mono{font:11px Consolas,monospace;color:var(--muted)}.pill{display:inline-block;padding:2px 9px;border-radius:999px;font-size:11px;font-weight:800;letter-spacing:.04em;white-space:nowrap}.pill.ok,.pill.green,.pill.GREEN{background:var(--green-bg);color:var(--green)}.pill.bad,.pill.red,.pill.RED,.pill.high{background:var(--red-bg);color:var(--red)}.pill.yellow,.pill.YELLOW,.pill.medium{background:var(--amber-bg);color:var(--amber)}.pill.info{background:var(--green-bg);color:var(--green)}.cluster-section{background:var(--white);border:1px solid var(--line);border-radius:12px;margin:14px 0;box-shadow:var(--shadow);overflow:hidden}.cluster-section>summary{list-style:none;cursor:pointer}.cluster-section>summary::-webkit-details-marker{display:none}.cluster-header{display:flex;justify-content:space-between;align-items:center;gap:20px;padding:18px 22px}.cluster-header h2{margin:4px 0;font-size:22px;color:var(--navy);display:inline}.cluster-header p{margin:0;color:var(--muted)}.chevron{display:inline-block;margin-right:8px;color:var(--muted);transition:transform .15s}details[open]>summary .chevron{transform:rotate(90deg)}.cluster-body{padding:2px 22px 22px;border-top:1px solid var(--line)}.cluster-body h3.section-title{margin-top:18px}.score-ring{width:78px;height:78px;border:6px solid var(--line);border-radius:50%;display:flex;flex-wrap:wrap;align-content:center;justify-content:center;line-height:1;flex:0 0 auto}.score-ring strong{font-size:21px}.score-ring span{font-size:10px;color:var(--muted);align-self:center;margin-left:2px}.score-ring small{width:100%;text-align:center;font-size:9px;font-weight:700;letter-spacing:.1em;margin-top:4px}.score-ring.red{border-color:#edb1b1;color:var(--red)}.score-ring.yellow{border-color:#efd58e;color:var(--amber)}.score-ring.green{border-color:#a8d9ba;color:var(--green)}tr.high{background:var(--red-bg)}tr.medium{background:var(--amber-bg)}tr.info{background:var(--green-bg)}.footer{color:var(--muted);font-size:12px;text-align:right;margin-top:18px}@media(max-width:760px){main{padding:16px 12px 40px}.hero{display:block;padding:24px}.hero h1{font-size:26px}.hero-meta{text-align:left;margin-top:18px}.summary{grid-template-columns:1fr 1fr}.overview{padding:16px}.cluster-header{align-items:flex-start;padding:16px}.score-ring{flex:0 0 68px;width:68px;height:68px}.data-table{font-size:12px}}@media(max-width:420px){.summary{grid-template-columns:1fr}.cluster-header h2{font-size:18px}}
-</style></head><body><main><header class='hero'><div><span class='eyebrow'>Informe de infraestructura critica</span><h1>Auditoria SQL Server Always On</h1><p>Evaluacion de homologacion, disponibilidad y rendimiento en VMware vSphere.</p></div><div class='hero-meta'><span>Generado</span><strong>%s</strong><span>Modo: %s</span></div></header><section class='summary'><div class='metric %s'><span>Score global</span><strong>%s/100</strong></div><div class='metric'><span>Clusters auditados</span><strong>%s</strong></div><div class='metric red'><span>Riesgos criticos</span><strong>%s</strong></div><div class='metric yellow'><span>Advertencias</span><strong>%s</strong></div></section>%s%s<footer class='footer'>Fuente: vCenter y configuracion declarada del inventario Always On.</footer></main></body></html>""".replace("%", "%%").replace("%%s", "%s") % (generated, html.escape(report.get("mode", "vCenter")), global_status.lower(), global_score, cluster_count, critical_count, warning_count, overview_html, "".join(rows)))
+    logo_uri = logo_data_uri()
+    letterhead_html = "<div class='letterhead'><img class='brand-logo' src='%s' alt='Henkia'></div>" % logo_uri if logo_uri else ""
+    footer_logo_html = "<img class='brand-logo-sm' src='%s' alt='Henkia'>" % logo_uri if logo_uri else ""
+    return ("""<!doctype html><html lang='es'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>Auditoria Always On</title><link rel='preconnect' href='https://fonts.googleapis.com'><link rel='preconnect' href='https://fonts.gstatic.com' crossorigin><link href='https://fonts.googleapis.com/css2?family=Open+Sans:wght@400;600;700&display=swap' rel='stylesheet'><style>
+:root{--ink:#17212b;--muted:#687582;--line:#dbe3e8;--paper:#f4f7f8;--white:#fff;--navy:#12344d;--red:#c43d3d;--red-bg:#fff1f1;--amber:#a66b00;--amber-bg:#fff8e6;--green:#28784b;--green-bg:#eaf7ef;--shadow:0 12px 28px rgba(18,52,77,.08);--brand-ink:#0f3024;--brand-green:#3cab54;--brand-teal:#71c1a9}*{box-sizing:border-box}body{margin:0;background:var(--paper);color:var(--ink);font:14px/1.5 'Open Sans',Inter,Segoe UI,Arial,sans-serif}main{max-width:1440px;margin:0 auto;padding:22px 28px 60px}.letterhead{padding:0 0 18px}.brand-logo{height:32px;display:block}.hero{background:var(--navy);color:#fff;border-radius:14px;padding:32px 36px;box-shadow:var(--shadow);display:flex;justify-content:space-between;gap:28px;align-items:flex-end}.eyebrow{text-transform:uppercase;letter-spacing:.12em;font-size:11px;font-weight:700;color:#7892a4}.hero .eyebrow{color:#9db7c8}.hero h1{font-size:32px;line-height:1.1;margin:7px 0 10px;font-weight:700}.hero p{margin:0;color:#c7d7e1}.hero-meta{text-align:right;color:#c7d7e1}.hero-meta strong{display:block;color:#fff;font-size:16px}.summary{display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin:22px 0}.metric{background:var(--white);border:1px solid var(--line);border-radius:10px;padding:18px 20px;box-shadow:var(--shadow)}.metric span{display:block;color:var(--muted);font-size:12px;text-transform:uppercase;letter-spacing:.06em}.metric strong{display:block;font-size:29px;margin-top:5px;color:var(--navy)}.metric.red strong{color:var(--red)}.metric.yellow strong{color:var(--amber)}.metric.green strong{color:var(--green)}.overview{background:var(--white);border:1px solid var(--line);border-radius:12px;padding:20px 22px;margin:20px 0;box-shadow:var(--shadow)}.section-title{font-size:17px;color:var(--navy);margin:6px 0 13px}.table-scroll{overflow-x:auto}.data-table{width:100%;border-collapse:collapse;font-size:13px}.data-table th,.data-table td{padding:8px 10px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top}.data-table thead th{background:#eef2f4;color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.05em;white-space:nowrap}.data-table td.num,.data-table th.num{text-align:right;font-variant-numeric:tabular-nums}.overview-table td:nth-child(2),.overview-table td:nth-child(3),.overview-table td:nth-child(4),.overview-table td:nth-child(6),.overview-table td:nth-child(7),.overview-table th:nth-child(2),.overview-table th:nth-child(3),.overview-table th:nth-child(4),.overview-table th:nth-child(6),.overview-table th:nth-child(7){text-align:right;font-variant-numeric:tabular-nums}.overview-table a{color:var(--navy);font-weight:700;text-decoration:none}.overview-table a:hover{text-decoration:underline}.muted{color:var(--muted);font-size:12px}.mono{font:11px Consolas,monospace;color:var(--muted)}.pill{display:inline-block;padding:2px 9px;border-radius:999px;font-size:11px;font-weight:800;letter-spacing:.04em;white-space:nowrap}.pill.ok,.pill.green,.pill.GREEN{background:var(--green-bg);color:var(--green)}.pill.bad,.pill.red,.pill.RED,.pill.high{background:var(--red-bg);color:var(--red)}.pill.yellow,.pill.YELLOW,.pill.medium{background:var(--amber-bg);color:var(--amber)}.pill.info{background:var(--green-bg);color:var(--green)}.cluster-section{background:var(--white);border:1px solid var(--line);border-radius:12px;margin:14px 0;box-shadow:var(--shadow);overflow:hidden}.cluster-section>summary{list-style:none;cursor:pointer}.cluster-section>summary::-webkit-details-marker{display:none}.cluster-header{display:flex;justify-content:space-between;align-items:center;gap:20px;padding:18px 22px}.cluster-header h2{margin:4px 0;font-size:22px;color:var(--navy);display:inline}.cluster-header p{margin:0;color:var(--muted)}.chevron{display:inline-block;margin-right:8px;color:var(--muted);transition:transform .15s}details[open]>summary .chevron{transform:rotate(90deg)}.cluster-body{padding:2px 22px 22px;border-top:1px solid var(--line)}.cluster-body h3.section-title{margin-top:18px}.score-ring{width:78px;height:78px;border:6px solid var(--line);border-radius:50%;display:flex;flex-wrap:wrap;align-content:center;justify-content:center;line-height:1;flex:0 0 auto}.score-ring strong{font-size:21px}.score-ring span{font-size:10px;color:var(--muted);align-self:center;margin-left:2px}.score-ring small{width:100%;text-align:center;font-size:9px;font-weight:700;letter-spacing:.1em;margin-top:4px}.score-ring.red{border-color:#edb1b1;color:var(--red)}.score-ring.yellow{border-color:#efd58e;color:var(--amber)}.score-ring.green{border-color:#a8d9ba;color:var(--green)}tr.high{background:var(--red-bg)}tr.medium{background:var(--amber-bg)}tr.info{background:var(--green-bg)}.footer{border-top:1px solid var(--line);margin-top:28px;padding-top:16px;display:flex;justify-content:space-between;align-items:center;gap:16px;flex-wrap:wrap}.footer-brand{display:flex;align-items:center;gap:10px}.footer-brand .brand-logo-sm{height:18px}.footer-tagline{color:var(--brand-ink);font-size:12px;font-weight:600;letter-spacing:.02em;white-space:nowrap}.footer-note{color:var(--muted);font-size:12px;text-align:right}@media(max-width:760px){main{padding:16px 12px 40px}.letterhead{padding:0 0 14px}.hero{display:block;padding:24px}.hero h1{font-size:26px}.hero-meta{text-align:left;margin-top:18px}.summary{grid-template-columns:1fr 1fr}.overview{padding:16px}.cluster-header{align-items:flex-start;padding:16px}.score-ring{flex:0 0 68px;width:68px;height:68px}.data-table{font-size:12px}.footer{flex-direction:column;align-items:flex-start}.footer-note{text-align:left}}@media(max-width:420px){.summary{grid-template-columns:1fr}.cluster-header h2{font-size:18px}}
+</style></head><body><main>%s<header class='hero'><div><span class='eyebrow'>Informe de infraestructura critica</span><h1>Auditoria SQL Server Always On</h1><p>Evaluacion de homologacion, disponibilidad y rendimiento en VMware vSphere.</p></div><div class='hero-meta'><span>Generado</span><strong>%s</strong><span>Modo: %s</span></div></header><section class='summary'><div class='metric %s'><span>Score global</span><strong>%s/100</strong></div><div class='metric'><span>Clusters auditados</span><strong>%s</strong></div><div class='metric red'><span>Riesgos criticos</span><strong>%s</strong></div><div class='metric yellow'><span>Advertencias</span><strong>%s</strong></div></section>%s%s<footer class='footer'><div class='footer-brand'>%s<span class='footer-tagline'>Committed to the outcome. &middot; www.henkia.com</span></div><div class='footer-note'>Fuente: vCenter y configuracion declarada del inventario Always On.</div></footer></main></body></html>""".replace("%", "%%").replace("%%s", "%s") % (letterhead_html, generated, html.escape(report.get("mode", "vCenter")), global_status.lower(), global_score, cluster_count, critical_count, warning_count, overview_html, "".join(rows), footer_logo_html))
 
 
 def main():
