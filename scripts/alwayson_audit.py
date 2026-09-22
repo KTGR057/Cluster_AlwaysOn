@@ -481,8 +481,6 @@ def compare_cluster(cluster, vms, drs):
     platform_versions = [vm["platform"]["virtual_hardware"] for vm in vms]
     if len(set(platform_versions)) > 1:
         add_finding(findings, "MEDIUM", "Version de hardware virtual inconsistente", "platform.virtual_hardware", dict(zip(names, platform_versions)), "igual en todos los nodos")
-    if any(vm["platform"]["tools_status"] not in ("toolsOk", "guestToolsCurrent", "Unknown") for vm in vms):
-        add_finding(findings, "MEDIUM", "Estado de VMware Tools requiere revision", "platform.tools", dict(zip(names, [vm["platform"]["tools_status"] for vm in vms])), "toolsOk/toolsCurrent")
     tools_versions = [vm["platform"]["tools_version"] for vm in vms]
     if len(set(tools_versions)) > 1 and "Unknown" not in tools_versions:
         add_finding(findings, "MEDIUM", "Version de VMware Tools inconsistente entre nodos", "platform.tools", dict(zip(names, tools_versions)), "misma version compatible en todos los nodos")
