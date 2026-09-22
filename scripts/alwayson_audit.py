@@ -38,6 +38,21 @@ def now_local():
     return dt.datetime.now(REPORT_TIMEZONE)
 
 
+MESES_ES = ["enero", "febrero", "marzo", "abril", "mayo", "junio", "julio", "agosto", "septiembre", "octubre", "noviembre", "diciembre"]
+
+
+def format_datetime_es(iso_string):
+    """Human-readable Spanish date/time for the report header; keeps the raw ISO string
+    (used in the JSON output) untouched and avoids depending on the container's locale."""
+    try:
+        value = dt.datetime.fromisoformat(iso_string)
+    except (TypeError, ValueError):
+        return iso_string
+    hour12 = value.hour % 12 or 12
+    meridiem = "a. m." if value.hour < 12 else "p. m."
+    return "%d de %s de %d, %02d:%02d %s" % (value.day, MESES_ES[value.month - 1], value.year, hour12, value.minute, meridiem)
+
+
 LOGO_PATH = Path(__file__).resolve().parent.parent / "assets" / "henkia_logo.png"
 
 
@@ -686,7 +701,7 @@ def html_report(report):
         "<section class='overview'><h2 class='section-title'>Resumen por cluster</h2><div class='table-scroll'><table class='data-table overview-table'><thead><tr><th>Cluster</th><th>Nodos</th><th>Hosts</th><th>Score</th><th>Estado</th><th>Criticos</th><th>Advertencias</th></tr></thead><tbody>%s</tbody></table></div></section>"
         % "".join(overview_rows)
     )
-    generated = html.escape(report["generated_at"])
+    generated = html.escape(format_datetime_es(report["generated_at"]))
     logo_uri = logo_data_uri()
     letterhead_html = "<div class='letterhead'><img class='brand-logo' src='%s' alt='Henkia'></div>" % logo_uri if logo_uri else ""
     footer_logo_html = "<img class='brand-logo-sm' src='%s' alt='Henkia'>" % logo_uri if logo_uri else ""
