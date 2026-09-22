@@ -10,6 +10,7 @@ import ssl
 import sys
 from collections import Counter
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import yaml
 
@@ -25,6 +26,15 @@ VCENTERS = {
     "vCenter_BTA": ("10.10.170.159", "dhcibogdc"),
     "vCenter_MDE": ("10.10.144.159", "dhcimdedc"),
 }
+
+# Los vCenter y servidores auditados estan en Colombia; se fija la zona horaria
+# explicitamente para que el reporte no dependa de la TZ del contenedor/agente
+# donde se ejecute el pipeline (por defecto suele quedar en UTC).
+REPORT_TIMEZONE = ZoneInfo(os.environ.get("REPORT_TIMEZONE", "America/Bogota"))
+
+
+def now_local():
+    return dt.datetime.now(REPORT_TIMEZONE)
 
 # Baseline supplied for the physical hosts: 2 sockets x 32 physical cores.
 HOST_NUMA_CORES = 32
@@ -62,6 +72,12 @@ def backing_type(backing):
     return "Unknown"
 
 
+def short_type_name(obj):
+    """pyVmomi __name__ is the fully qualified vmodl name (e.g. 'vim.vm.device.VirtualVmxnet3');
+    keep only the last segment so 'Virtual'/'Spec' stripping and equality checks work as intended."""
+    return type(obj).__name__.rsplit(".", 1)[-1]
+
+
 def datastore_policy(device):
     profiles = getattr(device, "profile", None) or []
     for profile in profiles:
@@ -78,7 +94,7 @@ def network_vlan(network):
     if vlan_id is not None:
         return vlan_id
     if vlan_spec is not None:
-        return type(vlan_spec).__name__.replace("Spec", "")
+        return short_type_name(vlan_spec).replace("Spec", "")
     return "No expuesto por API"
 
 
@@ -204,7 +220,7 @@ def vm_snapshot(vm, content=None):
         if isinstance(device, vim.vm.device.VirtualSCSIController):
             controllers.append({
                 "label": device.deviceInfo.label if device.deviceInfo else str(device.key),
-                "type": type(device).__name__.replace("Virtual", ""),
+                "type": short_type_name(device).replace("Virtual", ""),
                 "bus_number": device.busNumber,
             })
         elif isinstance(device, vim.vm.device.VirtualDisk):
@@ -222,7 +238,7 @@ def vm_snapshot(vm, content=None):
             network = resolve_network(content, backing)
             networks.append({
                 "label": device.deviceInfo.label if device.deviceInfo else str(device.key),
-                "adapter": type(device).__name__.replace("Virtual", ""),
+                "adapter": short_type_name(device).replace("Virtual", ""),
                 "network": prop(network, "name", None) or getattr(backing, "deviceName", "Unknown"),
                 "vlan": network_vlan(network),
                 "mtu": network_mtu(network),
@@ -400,7 +416,6 @@ def add_finding(findings, severity, message, parameter, actual=None, expected=No
         "os.identity": "Confirmar el OS dentro del guest, actualizar VMware Tools y corregir el Guest OS configurado en vCenter si corresponde.",
         "drs.anti_affinity": "Crear regla DRS VM-VM Separate Virtual Machines con todos los nodos del grupo.",
         "storage.datastore_affinity": "Ubicar los nodos en datastores/failure domains fisicos distintos o documentar la excepcion.",
-        "storage.disk_datastore_split": "Distribuir los VMDK de datos, logs y tempDB en datastores/LUNs distintos segun el patron de I/O de cada uno.",
         "network.dedicated_cluster_network": "Agregar un adaptador de red dedicado (VLAN separada) para trafico de cluster/heartbeat y replica de Always On, distinto del trafico de aplicacion/cliente.",
         "platform.snapshots": "Eliminar snapshots activos y usar backups nativos de SQL Server (Full/Log) o una solucion VSS certificada en lugar de snapshots de VM para nodos de produccion.",
         "platform.latency_sensitivity": "Evaluar Latency Sensitivity = High solo si CPU y memoria ya estan reservadas al 100% y la carga es critica en latencia; requiere validacion de NIC/vmxnet3 y capacidad del host.",
@@ -456,9 +471,6 @@ def compare_cluster(cluster, vms, drs):
             vlans = {network["vlan"] for network in vm["networks"]}
             if len(vlans) == 1:
                 add_finding(findings, "MEDIUM", "Todos los adaptadores de red del nodo estan en la misma VLAN; no hay evidencia de una red dedicada para trafico de cluster/AG", "network.dedicated_cluster_network", {vm["name"]: sorted(str(v) for v in vlans)}, "VLANs distintas para trafico de cliente y trafico de cluster/AG")
-        vm_datastores = {disk["datastore"] for disk in vm["disks"]}
-        if len(vm["disks"]) > 1 and len(vm_datastores) == 1:
-            add_finding(findings, "MEDIUM", "Todos los discos del nodo estan en el mismo datastore", "storage.disk_datastore_split", {vm["name"]: sorted(vm_datastores)}, "separar OS, datos, logs y tempDB en datastores distintos cuando el diseno de almacenamiento lo permita")
     if any(vm["has_snapshots"] for vm in vms):
         add_finding(findings, "HIGH", "Uno o mas nodos tienen snapshots activos", "platform.snapshots", {vm["name"]: vm["has_snapshots"] for vm in vms}, "sin snapshots activos en nodos de produccion")
     if any(vm["latency_sensitivity"]["level"] != "high" for vm in vms):
@@ -542,7 +554,7 @@ def offline_report(config):
         vms = [mock_vm(node["name"], index) for index, node in enumerate(cluster["nodes"], 1)]
         drs = [{"severity": "HIGH", "parameter": "drs.anti_affinity", "message": "Modo offline: no se valido la regla DRS contra vCenter", "nodes": [node["name"] for node in cluster["nodes"]]}]
         results.append(compare_cluster(cluster, vms, drs))
-    return {"generated_at": dt.datetime.now(dt.timezone.utc).isoformat(), "vcenter": None, "mode": "offline", "clusters": results}
+    return {"generated_at": now_local().isoformat(), "vcenter": None, "mode": "offline", "clusters": results}
 
 
 def slugify(value):
@@ -581,7 +593,6 @@ def html_report(report):
             shares_text = "%s (%s)" % (shares["level"], shares["shares"] if shares["shares"] is not None else "default")
             controller_summary = ", ".join("%s x%s" % item for item in Counter(c["type"] for c in vm["controllers"]).items()) or "No informado"
             disk_summary = ", ".join("%s: %s" % item for item in Counter(d["provisioning"] for d in vm["disks"]).items()) or "No informado"
-            datastore_summary = ", ".join(sorted({disk["datastore"] for disk in vm["disks"]})) or "No informado"
             network_summary = ", ".join("%s / %s: %s" % (n["adapter"], n["network"], n["mtu"]) for n in vm["networks"]) or "No informado"
             topology_pill = "ok" if recommendation["status"] == "ALINEADA" else "bad"
             os_pill = "ok" if vm["os"]["status"] == "COINCIDE" else "bad"
@@ -603,8 +614,8 @@ def html_report(report):
                    os_pill, vm["os"]["status"])
             )
             storage_table_rows.append(
-                "<tr><td><strong>%s</strong></td><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>"
-                % (html.escape(vm["name"]), html.escape(controller_summary), html.escape(disk_summary), html.escape(datastore_summary), html.escape(network_summary))
+                "<tr><td><strong>%s</strong></td><td>%s</td><td>%s</td><td>%s</td></tr>"
+                % (html.escape(vm["name"]), html.escape(controller_summary), html.escape(disk_summary), html.escape(network_summary))
             )
         finding_rows = []
         for finding in cluster["findings"]:
@@ -624,7 +635,7 @@ def html_report(report):
         rows.append(
             "<details class='cluster-section' id='%s'%s><summary class='cluster-header'><div><span class='chevron'>&#9656;</span><span class='eyebrow'>Cluster Always On</span><h2>%s</h2><p>%s nodos · %s host(s) fisico(s)</p></div><div class='score-ring %s'><strong>%s</strong><span>/100</span><small>%s</small></div></summary><div class='cluster-body'>"
             "<h3 class='section-title'>Nodos</h3><div class='table-scroll'><table class='data-table node-table'><thead><tr><th>Nodo</th><th>Host ESXi</th><th>CPU</th><th>RAM</th><th>Plataforma</th><th>OS</th></tr></thead><tbody>%s</tbody></table></div>"
-            "<h3 class='section-title'>Aprovisionamiento y red</h3><div class='table-scroll'><table class='data-table storage-table'><thead><tr><th>Nodo</th><th>Controladoras</th><th>Discos</th><th>Datastores</th><th>Red (adaptador / VLAN / MTU)</th></tr></thead><tbody>%s</tbody></table></div>"
+            "<h3 class='section-title'>Aprovisionamiento y red</h3><div class='table-scroll'><table class='data-table storage-table'><thead><tr><th>Nodo</th><th>Controladoras</th><th>Discos</th><th>Red (adaptador / VLAN / MTU)</th></tr></thead><tbody>%s</tbody></table></div>"
             "<h3 class='section-title'>Hallazgos y remediacion</h3>%s</div></details>"
             % (slug, open_attr, html.escape(cluster["name"]), node_count, len(performance["physical_hosts"]),
                performance["status"].lower(), performance["score"], performance["status"],
@@ -682,7 +693,7 @@ def main():
                 if vcenter_nodes:
                     findings.extend(drs_findings(content, vcenter_nodes))
             results.append(compare_cluster(cluster, vms, findings))
-        report = {"generated_at": dt.datetime.now(dt.timezone.utc).isoformat(), "vcenters": hosts, "mode": "vcenter", "clusters": results}
+        report = {"generated_at": now_local().isoformat(), "vcenters": hosts, "mode": "vcenter", "clusters": results}
     finally:
         for service in services.values():
             connect.Disconnect(service)
@@ -692,7 +703,7 @@ def main():
 def write_report(report, output_dir):
     output = Path(output_dir)
     output.mkdir(parents=True, exist_ok=True)
-    stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+    stamp = now_local().strftime("%Y%m%d-%H%M%S")
     (output / ("alwayson-audit-%s.json" % stamp)).write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
     (output / ("alwayson-audit-%s.html" % stamp)).write_text(html_report(report), encoding="utf-8")
     print("Auditoria completada en modo %s: %d cluster(s), %d hallazgo(s)" % (report["mode"] if report.get("mode") else "vcenter", len(report["clusters"]), sum(len(c["findings"]) for c in report["clusters"])))

@@ -56,7 +56,7 @@ pipeline {
                     sh '''
                         apt-get update && apt-get install -y git
                         pip install --upgrade pip
-                        pip install "ansible-core<2.17" "ansible<10.0" "pyvmomi==8.0.3.0.1" PyYAML Jinja2
+                        pip install "ansible-core<2.17" "ansible<10.0" "pyvmomi==8.0.3.0.1" PyYAML Jinja2 tzdata
                     '''
                 }
             }
